@@ -140,11 +140,6 @@
                 Users can authenticate with either their standard password or TPM PIN.
               '';
             };
-            enablLoginPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-            };
-
             enableSystemAuthPin = lib.mkOption {
               type = lib.types.bool;
               default = false;
@@ -413,13 +408,16 @@
               })
 
               # Append master-key auth module to selected PAM services
-              (let
-                enabledServices = lib.filterAttrs (
-                  _service: serviceCfg:
-                  (serviceCfg.enable or false)
-                ) cfg.substituteMasterKeyAuth;
+              # Guard: only evaluate when user has configured at least one service
+              # Using builtins.attrNames avoids forcing attrset values which would cause recursion
+              (lib.mkIf (builtins.attrNames cfg.substituteMasterKeyAuth != []) (
+                let
+                  enabledServices = lib.filterAttrs (
+                    _service: serviceCfg:
+                    (serviceCfg.enable or false)
+                  ) cfg.substituteMasterKeyAuth;
 
-                mkMasterKeyRuleFor = service: serviceCfg:
+                  mkMasterKeyRuleFor = service: serviceCfg:
                   let
                     denyRuleName = "pinpamMasterKeyDeny";
                     masterKeyRuleName = "pinpamMasterKey";
@@ -446,8 +444,9 @@
                         };
                       };
                   };
-              in
-              lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices))
+                in
+                lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices)
+              ))
             ]
           );
         };
