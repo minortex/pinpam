@@ -311,11 +311,15 @@
                 For each enabled service, this module inserts rules at the configured order:
 
                 auth requisite pam_deny.so           (order = denyOrder)
-                auth sufficient libpinpam_master_key.so (order = masterKeyOrder)
+                auth optional  libpinpam_master_key.so (order = masterKeyOrder)
+                auth sufficient pam_permit.so           (order = masterKeyOrder + 1)
 
                 Rules listed in rewriteSuccessJumps are rewritten to
                 "[success=<jump> default=ignore]".
                 rewriteSufficientRules is retained as compatibility shorthand for jump=1.
+
+                This preserves the success-gated routing while preventing lockouts if the
+                master-key substitution module returns a non-success status.
 
                 NOTE: You must also set enableMasterKeySubstitution = true for this to take effect.
               '';
@@ -466,6 +470,7 @@
                       let
                         denyRuleName = "pinpamMasterKeyDeny";
                         masterKeyRuleName = "pinpamMasterKey";
+                        permitRuleName = "pinpamMasterKeyPermit";
                         legacyRewriteJumps = lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: 1);
                         rewriteJumpMap = legacyRewriteJumps // serviceCfg.rewriteSuccessJumps;
 
@@ -486,9 +491,15 @@
                             };
 
                             "${masterKeyRuleName}" = {
-                              control = "sufficient";
+                              control = "optional";
                               modulePath = "${pinpamPkg}/lib/security/libpinpam_master_key.so";
                               order = serviceCfg.masterKeyOrder;
+                            };
+
+                            "${permitRuleName}" = {
+                              control = "sufficient";
+                              modulePath = "pam_permit.so";
+                              order = serviceCfg.masterKeyOrder + 1;
                             };
                           };
                       };
