@@ -109,7 +109,23 @@
           ...
         }:
         let
-          cfg = config.security.pinpam;
+          # Bind individual leaves to avoid forcing evaluation of the whole security.pinpam subtree
+          pinpamEnable = config.security.pinpam.enable;
+          pinpamPkg = config.security.pinpam.package;
+          enableTpmAccess = config.security.pinpam.enableTpmAccess;
+          enableSudoPin = config.security.pinpam.enableSudoPin;
+          enableLoginPin = config.security.pinpam.enableLoginPin;
+          enableKdePin = config.security.pinpam.enableKdePin;
+          enableSystemAuthPin = config.security.pinpam.enableSystemAuthPin;
+          enableHyprlockPin = config.security.pinpam.enableHyprlockPin;
+          enablePolkitPin = config.security.pinpam.enablePolkitPin;
+          pinutilPath = config.security.pinpam.pinutilPath;
+          policyFile = config.security.pinpam.policyFile;
+          pinPolicyMinLength = config.security.pinpam.pinPolicy.minLength;
+          pinPolicyMaxLength = config.security.pinpam.pinPolicy.maxLength;
+          pinPolicyMaxAttempts = config.security.pinpam.pinPolicy.maxAttempts;
+          enableMasterKeySubstitution = config.security.pinpam.enableMasterKeySubstitution;
+          substituteMasterKeyAuth = config.security.pinpam.substituteMasterKeyAuth;
         in
         {
           options.security.pinpam = {
@@ -296,18 +312,18 @@
             };
           };
 
-          config = lib.mkIf cfg.enable (
+          config = lib.mkIf pinpamEnable (
             lib.mkMerge [
               {
                 # Add the PAM module to the system
-                environment.systemPackages = [ cfg.package ];
+                environment.systemPackages = [ pinpamPkg ];
 
                 # Set up security wrapper for pinutil with setgid
                 security.wrappers.pinutil = {
                   setgid = true;
                   owner = "root";
                   group = "tss";
-                  source = "${cfg.package}/bin/pinutil";
+                  source = "${pinpamPkg}/bin/pinutil";
                 };
 
                 # Ensure tss group exists
@@ -315,10 +331,10 @@
 
                 # Install policy file
                 environment.etc."pinpam/policy" =
-                  if cfg.policyFile != null then
+                  if policyFile != null then
                     {
                       # Use custom policy file
-                      source = cfg.policyFile;
+                      source = policyFile;
                       mode = "0644";
                       user = "root";
                       group = "root";
@@ -329,14 +345,14 @@
                       text =
                         let
                           policyLines = [
-                            "pin_min_length=${toString cfg.pinPolicy.minLength}"
+                            "pin_min_length=${toString pinPolicyMinLength}"
                           ]
                           ++ lib.optional (
-                            cfg.pinPolicy.maxLength != null
-                          ) "pin_max_length=${toString cfg.pinPolicy.maxLength}"
+                            pinPolicyMaxLength != null
+                          ) "pin_max_length=${toString pinPolicyMaxLength}"
                           ++ [
-                            "pin_lockout_max_attempts=${toString cfg.pinPolicy.maxAttempts}"
-                            "pinutil_path=${toString cfg.pinutilPath}"
+                            "pin_lockout_max_attempts=${toString pinPolicyMaxAttempts}"
+                            "pinutil_path=${toString pinutilPath}"
                           ];
                         in
                         lib.concatStringsSep "\n" (policyLines ++ [ "" ]);
@@ -347,7 +363,7 @@
               }
 
               # TPM access configuration
-              (lib.mkIf cfg.enableTpmAccess {
+              (lib.mkIf enableTpmAccess {
                 # Enable udev service
                 services.udev.enable = true;
 
@@ -360,55 +376,55 @@
               })
 
               # Sudo PAM configuration
-              (lib.mkIf cfg.enableSudoPin {
+              (lib.mkIf enableSudoPin {
                 security.pam.services.sudo.rules.auth.pinpam = {
                   control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                   order = 11050;  # Default unix order is 11100, place before it
                 };
               })
 
               # Login PAM configuration
-              (lib.mkIf cfg.enableLoginPin {
+              (lib.mkIf enableLoginPin {
                 security.pam.services.login.rules.auth.pinpam = {
                   control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                   order = 11050;
                 };
               })
               # KDE PAM configuration
-              (lib.mkIf cfg.enableKdePin {
+              (lib.mkIf enableKdePin {
                 security.pam.services.kde.rules.auth.pinpam = {
                   control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                   order = 11050;
                 };
               })
-              (lib.mkIf cfg.enableSystemAuthPin {
+              (lib.mkIf enableSystemAuthPin {
                 security.pam.services."system-auth".rules.auth.pinpam = {
                   control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                   order = 11050;
                 };
               })
 
-              (lib.mkIf cfg.enableHyprlockPin {
+              (lib.mkIf enableHyprlockPin {
                 security.pam.services.hyprlock.rules.auth.pinpam = {
                   control = "sufficient";
                   order = 11050;
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                 };
               })
 
-              (lib.mkIf cfg.enablePolkitPin {
+              (lib.mkIf enablePolkitPin {
                 security.pam.services.polkit-1.rules.auth.pinpam = {
                   control = "sufficient";
                   order = 11050;
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  modulePath = "${pinpamPkg}/lib/security/libpinpam.so";
                 };
               })
 
-              (lib.mkIf cfg.enablePolkitPin {
+              (lib.mkIf enablePolkitPin {
                 systemd.services."polkit-agent-helper@".serviceConfig = {
                   PrivateDevices = "no";
                   DeviceAllow = [
@@ -420,12 +436,12 @@
 
               # Append master-key auth module to selected PAM services
               # Guarded by plain if/else to avoid evaluating substituteMasterKeyAuth when disabled
-              (if cfg.enableMasterKeySubstitution then
+              (if enableMasterKeySubstitution then
                 (let
                   enabledServices = lib.filterAttrs (
                     _service: serviceCfg:
                     (serviceCfg.enable or false)
-                  ) cfg.substituteMasterKeyAuth;
+                  ) substituteMasterKeyAuth;
 
                   mkMasterKeyRuleFor = service: serviceCfg:
                   let
@@ -449,7 +465,7 @@
 
                         "${masterKeyRuleName}" = {
                           control = "optional";
-                          modulePath = "${cfg.package}/lib/security/libpinpam_master_key.so";
+                          modulePath = "${pinpamPkg}/lib/security/libpinpam_master_key.so";
                           order = serviceCfg.masterKeyOrder;
                         };
                       };
