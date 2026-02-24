@@ -29,3 +29,14 @@ pin_del_invalid: "incorrect PIN"
 pin_del_invalid_locked: "incorrect PIN (now locked due to too many attempts)"
 pin_del_locked_out: "PIN locked out due to too many failed attempts"
 
+# Master key
+mk_sealed_file_already_exists: "sealed master-key file already exists"
+mk_rsa_parent_already_present_refuse_import: "RSA parent handle already present; refusing to import"
+mk_hmac_handle_already_present_refuse_import: "HMAC master-key handle already present; refusing to import"
+mk_sealed_file_not_present: "sealed master-key file not present"
+mk_sealed_data_unexpected_length: "sealed master-key data has unexpected length"
+mk_hmac_handle_already_exists: "HMAC master-key handle already exists"
+mk_unsupported_sealed_file_version: "unsupported sealed file version"
+mk_invalid_nonce_length: "invalid sealed nonce length"
+mk_invalid_sealed_file_path: "invalid sealed file path"
+

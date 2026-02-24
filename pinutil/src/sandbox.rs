@@ -10,7 +10,11 @@ pub fn pinutil_sandbox() -> Result<(), RulesetError> {
         .handle_access(AccessFs::from_write(abi))?
         .handle_access(AccessNet::from_all(abi))?
         .create()?
-        .add_rules(path_beneath_rules(&["/dev"], AccessFs::from_write(abi)))?
+        // Allow TPM device writes and master-key sealed recovery blob writes.
+        .add_rules(path_beneath_rules(
+            &["/dev", "/var/"],
+            AccessFs::from_write(abi),
+        ))?
         .restrict_self()?;
     match status.ruleset {
         // The FullyEnforced case must be tested by the developer.

@@ -27,3 +27,28 @@ locked_out: "Vymknutý: %{locked}"
 yes: "Áno"
 no: "Nie"
 
+# Master key (AI generated translations for these strings may be inaccurate, please open a PR
+# if you speak Slovak and can provide better translations)
+requires_interactive_confirmation: "%{purpose} vyžaduje interaktívne potvrdenie"
+mk_purpose_import: "import hlavného kľúča"
+mk_purpose_tpm_clear: "vymazanie hlavného kľúča z TPM"
+mk_purpose_disk_clear: "vymazanie zapečatených dát z disku"
+
+mk_warn_init_new_key: "VAROVANIE: Týmto inicializujete nový TPM hlavný kľúč."
+mk_warn_init_break_old_unlocks: "VAROVANIE: Existujúce automatické odomknutie závislé od starého tokenu prestane fungovať."
+mk_proceed_prompt: "Pokračovať? (y/N): "
+
+mk_recovery_phrase_header: "Obnovovacia fráza (zobrazí sa len raz):"
+mk_recovery_confirm_prompt: "Pre potvrdenie opíšte obnovovaciu frázu: "
+mk_recovery_confirm_mismatch: "obnovovacia fráza sa nezhoduje"
+
+mk_recovery_phrase_prompt: "Obnovovacia fráza: "
+mk_import_success: "Hlavný kľúč bol importovaný do TPM."
+
+mk_warn_clear_tpm: "VAROVANIE: Toto odstráni perzistentné handly hlavného kľúča z TPM."
+mk_ack_prompt: "Napíšte 'yes' pre pokračovanie: "
+mk_clear_tpm_success: "Handly hlavného kľúča boli odstránené z TPM."
+
+mk_warn_clear_disk: "VAROVANIE: Toto vymaže %{path}."
+mk_clear_disk_success: "Zapečatený súbor obnovy hlavného kľúča bol vymazaný."
+

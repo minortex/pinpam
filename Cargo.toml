@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "pinpam-core",
+    "pinpam-core", "pinpam-master-key-pam",
     "pinpam-pam", 
     "pinutil"
 ]

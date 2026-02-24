@@ -2,6 +2,8 @@
 
 use clap::{Parser, Subcommand};
 use pinpam_core::{
+    master_key,
+    pinconstants::MASTER_KEY_SEALED_FILE,
     pindata::AttemptInfo,
     pinerror::{DeleteResult, PinError, PinResult, VerificationResult},
     pinmanager::PinManager,
@@ -65,6 +67,29 @@ enum Commands {
         #[arg(value_name = "USERNAME")]
         username: Option<String>,
     },
+
+    /// Manage the TPM-backed master AUTHTOK key
+    #[command(subcommand)]
+    MasterKey(MasterKeyCommands),
+}
+
+#[derive(Subcommand)]
+enum MasterKeyCommands {
+    /// Initialize a new TPM-backed master key and write recovery data to disk
+    Init,
+    /// Show master-key provisioning status
+    Status,
+    /// Import the master key into TPM using the recovery phrase
+    ImportToTpm,
+    /// Remove master-key persistent handles from TPM
+    ClearFromTpm,
+    /// Delete the sealed recovery blob from disk
+    ClearFromDisk,
+    /// Derive and print the per-user token for a username
+    GetUserToken {
+        #[arg(value_name = "USERNAME")]
+        username: String,
+    },
 }
 
 fn main() -> PinResult<()> {
@@ -101,8 +126,136 @@ fn main() -> PinResult<()> {
         Commands::Status { username } => {
             handle_result(show_status(&resolve_username(username)?, machine), machine)
         }
+        Commands::MasterKey(cmd) => match cmd {
+            MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
+            MasterKeyCommands::Status => handle_result(master_key_status(machine), machine),
+            MasterKeyCommands::ImportToTpm => handle_result(master_key_import_to_tpm(machine), machine),
+            MasterKeyCommands::ClearFromTpm => handle_result(master_key_clear_from_tpm(machine), machine),
+            MasterKeyCommands::ClearFromDisk => handle_result(master_key_clear_from_disk(machine), machine),
+            MasterKeyCommands::GetUserToken { username } => {
+                if machine {
+                    handle_result(master_key_get_user_token(&username), machine)
+                } else {
+                    // Human mode must print the token.
+                    match master_key_get_user_token(&username) {
+                        Ok(token) => println!("{token}"),
+                        Err(e) => {
+                            eprintln!("{}", t!("error_result", "error" => e));
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        },
     };
     Ok(())
+}
+
+fn require_interactive(machine: bool, purpose: String) -> PinResult<()> {
+    if machine {
+        return Err(PinError::TermIoError(
+            t!("requires_interactive_confirmation", "purpose" => purpose).to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_line(prompt: &str) -> PinResult<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str) -> PinResult<bool> {
+    let input = prompt_line(prompt)?;
+    Ok(input.trim().to_lowercase().starts_with('y'))
+}
+
+fn prompt_acknowledgement(expected: &str, prompt: &str) -> PinResult<()> {
+    let got = prompt_line(prompt)?;
+    if got.trim() != expected {
+        return Err(PinError::TermIoError(t!("cancelled").to_string()));
+    }
+    Ok(())
+}
+
+fn master_key_status(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyStatus> {
+    let st = master_key::status()?;
+    if !machine {
+        println!("sealed_file_present: {}", st.sealed_file_present);
+        println!("rsa_parent_present: {}", st.rsa_parent_present);
+        println!("hmac_key_present: {}", st.hmac_key_present);
+        println!("sealed_file_path: {}", st.sealed_file_path);
+        println!("rsa_handle: 0x{:08x}", st.rsa_handle);
+        println!("hmac_handle: 0x{:08x}", st.hmac_handle);
+    }
+    Ok(st)
+}
+
+fn master_key_init(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyInitResult> {
+    if !machine {
+        eprintln!("{}", t!("mk_warn_init_new_key"));
+        eprintln!("{}", t!("mk_warn_init_break_old_unlocks"));
+        let proceed_prompt = t!("mk_proceed_prompt");
+        if !prompt_yes_no(&proceed_prompt)? {
+            return Err(PinError::TermIoError(t!("cancelled").to_string()));
+        }
+    }
+
+    let res = master_key::init()?;
+    if !machine {
+        println!(
+            "\n{}\n\n{}\n",
+            t!("mk_recovery_phrase_header"),
+            res.recovery_phrase
+        );
+        let confirm_prompt = t!("mk_recovery_confirm_prompt");
+        let confirm = prompt_line(&confirm_prompt)?;
+        if confirm.trim() != res.recovery_phrase.trim() {
+            return Err(PinError::TermIoError(
+                t!("mk_recovery_confirm_mismatch").to_string(),
+            ));
+        }
+    }
+    Ok(res)
+}
+
+fn master_key_import_to_tpm(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyStatus> {
+    require_interactive(machine, t!("mk_purpose_import").to_string())?;
+    let phrase_prompt = t!("mk_recovery_phrase_prompt");
+    let phrase = prompt_line(&phrase_prompt)?;
+    let st = master_key::import_to_tpm(&phrase)?;
+    println!("{}", t!("mk_import_success"));
+    Ok(st)
+}
+
+fn master_key_clear_from_tpm(machine: bool) -> PinResult<()> {
+    require_interactive(machine, t!("mk_purpose_tpm_clear").to_string())?;
+    eprintln!("{}", t!("mk_warn_clear_tpm"));
+    let ack_prompt = t!("mk_ack_prompt");
+    prompt_acknowledgement("yes", &ack_prompt)?;
+    master_key::clear_from_tpm()?;
+    println!("{}", t!("mk_clear_tpm_success"));
+    Ok(())
+}
+
+fn master_key_clear_from_disk(machine: bool) -> PinResult<()> {
+    require_interactive(machine, t!("mk_purpose_disk_clear").to_string())?;
+    eprintln!(
+        "{}",
+        t!("mk_warn_clear_disk", "path" => MASTER_KEY_SEALED_FILE)
+    );
+    let ack_prompt = t!("mk_ack_prompt");
+    prompt_acknowledgement("yes", &ack_prompt)?;
+    master_key::clear_from_disk()?;
+    println!("{}", t!("mk_clear_disk_success"));
+    Ok(())
+}
+
+fn master_key_get_user_token(username: &str) -> PinResult<String> {
+    master_key::derive_user_token(username)
 }
 
 fn handle_result<T>(res: PinResult<T>, machine: bool)

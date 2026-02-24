@@ -77,6 +77,7 @@
               # Install PAM module (shared library from pinpam-pam crate)
               mkdir -p $out/lib/security
               cp target/release/libpinpam.so $out/lib/security/
+              cp target/release/libpinpam_master_key.so $out/lib/security/
 
               # Install pinutil binary
               mkdir -p $out/bin
@@ -241,6 +242,29 @@
                 pin_min_length=4 pin_max_length=8 pin_lockout_max_attempts=5
               '';
             };
+
+            substituteMasterKeyAuth = lib.mkOption {
+              type = lib.types.attrsOf (
+                lib.types.submodule (
+                  { name, ... }:
+                  {
+                    options.enable = lib.mkEnableOption (
+                      "Insert pinpam master-key module into the '${name}' PAM service auth stack"
+                    );
+                  }
+                )
+              );
+              default = { };
+              description = ''
+                Per-PAM-service toggles to append the pinpam master-key module to the bottom
+                of the auth stack.
+
+                For each enabled service, this module computes the maximum existing auth rule
+                order and inserts an additional rule after it:
+
+                auth optional libpinpam_master_key.so
+              '';
+            };
           };
 
           config = lib.mkIf cfg.enable (
@@ -398,6 +422,76 @@
                   ];
                 };
               })
+
+              # Append master-key auth module to selected PAM services
+              (let
+                enabledServices = lib.filterAttrs (
+                  _service: serviceCfg:
+                  (serviceCfg.enable or false)
+                ) cfg.substituteMasterKeyAuth;
+
+                mkMasterKeyRuleFor = service:
+                  let
+                    denyRuleName = "pinpamMasterKeyDeny";
+                    masterKeyRuleName = "pinpamMasterKey";
+                    authRules = lib.attrByPath [
+                      "security"
+                      "pam"
+                      "services"
+                      service
+                      "rules"
+                      "auth"
+                    ] { } config;
+
+                    otherAuthRules = builtins.removeAttrs authRules [ denyRuleName masterKeyRuleName ];
+                    otherAuthRuleValues = builtins.attrValues otherAuthRules;
+                    otherAuthRuleNames = builtins.attrNames otherAuthRules;
+                    maxOtherOrder =
+                      if otherAuthRuleValues == [ ] then
+                        1000
+                      else
+                        lib.foldl' (
+                          acc: rule:
+                          let
+                            ruleOrder = rule.order or 0;
+                          in
+                          if ruleOrder > acc then ruleOrder else acc
+                        ) 0 otherAuthRuleValues;
+
+                    rewriteSufficientRuleNames = lib.filter (
+                      ruleName:
+                      let
+                        controlValue = authRules.${ruleName}.control or null;
+                      in
+                      controlValue == "sufficient" || controlValue == "[success=1 default=ignore]"
+                    ) otherAuthRuleNames;
+
+                    sufficientControlOverrides = lib.genAttrs rewriteSufficientRuleNames (_ruleName: {
+                      control = "[success=1 default=ignore]";
+                    });
+
+                    denyOrder = maxOtherOrder + 10;
+                    masterKeyOrder = maxOtherOrder + 20;
+                  in
+                  {
+                    security.pam.services."${service}".rules.auth =
+                      sufficientControlOverrides
+                      // {
+                        "${denyRuleName}" = {
+                          control = "requisite";
+                          modulePath = "pam_deny.so";
+                          order = denyOrder;
+                        };
+
+                        "${masterKeyRuleName}" = {
+                          control = "optional";
+                          modulePath = "${cfg.package}/lib/security/libpinpam_master_key.so";
+                          order = masterKeyOrder;
+                        };
+                      };
+                  };
+              in
+              lib.mkMerge (lib.mapAttrsToList (service: _v: mkMasterKeyRuleFor service) enabledServices))
             ]
           );
         };
