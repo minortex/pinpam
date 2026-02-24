@@ -251,6 +251,25 @@
                     options.enable = lib.mkEnableOption (
                       "Insert pinpam master-key module into the '${name}' PAM service auth stack"
                     );
+                    options.rewriteSufficientRules = lib.mkOption {
+                      type = lib.types.listOf lib.types.str;
+                      default = [ "unix" ];
+                      description = ''
+                        List of auth rule names whose control should be rewritten from "sufficient"
+                        to "[success=1 default=ignore]" so that after success they skip the deny
+                        rule and reach the master-key module.
+                      '';
+                    };
+                    options.denyOrder = lib.mkOption {
+                      type = lib.types.int;
+                      default = 9900;
+                      description = "Order for the pam_deny.so rule inserted before master-key.";
+                    };
+                    options.masterKeyOrder = lib.mkOption {
+                      type = lib.types.int;
+                      default = 9910;
+                      description = "Order for the libpinpam_master_key.so rule.";
+                    };
                   }
                 )
               );
@@ -259,10 +278,13 @@
                 Per-PAM-service toggles to append the pinpam master-key module to the bottom
                 of the auth stack.
 
-                For each enabled service, this module computes the maximum existing auth rule
-                order and inserts an additional rule after it:
+                For each enabled service, this module inserts rules at the configured order:
 
-                auth optional libpinpam_master_key.so
+                auth requisite pam_deny.so           (order = denyOrder)
+                auth optional  libpinpam_master_key.so (order = masterKeyOrder)
+
+                Rules listed in rewriteSufficientRules have their control changed to
+                "[success=1 default=ignore]" so successful auth skips the deny rule.
               '';
             };
           };
@@ -430,48 +452,15 @@
                   (serviceCfg.enable or false)
                 ) cfg.substituteMasterKeyAuth;
 
-                mkMasterKeyRuleFor = service:
+                mkMasterKeyRuleFor = service: serviceCfg:
                   let
                     denyRuleName = "pinpamMasterKeyDeny";
                     masterKeyRuleName = "pinpamMasterKey";
-                    authRules = lib.attrByPath [
-                      "security"
-                      "pam"
-                      "services"
-                      service
-                      "rules"
-                      "auth"
-                    ] { } config;
 
-                    otherAuthRules = builtins.removeAttrs authRules [ denyRuleName masterKeyRuleName ];
-                    otherAuthRuleValues = builtins.attrValues otherAuthRules;
-                    otherAuthRuleNames = builtins.attrNames otherAuthRules;
-                    maxOtherOrder =
-                      if otherAuthRuleValues == [ ] then
-                        1000
-                      else
-                        lib.foldl' (
-                          acc: rule:
-                          let
-                            ruleOrder = rule.order or 0;
-                          in
-                          if ruleOrder > acc then ruleOrder else acc
-                        ) 0 otherAuthRuleValues;
-
-                    rewriteSufficientRuleNames = lib.filter (
-                      ruleName:
-                      let
-                        controlValue = authRules.${ruleName}.control or null;
-                      in
-                      controlValue == "sufficient" || controlValue == "[success=1 default=ignore]"
-                    ) otherAuthRuleNames;
-
-                    sufficientControlOverrides = lib.genAttrs rewriteSufficientRuleNames (_ruleName: {
+                    # Rewrite specified rules to use skip-on-success control
+                    sufficientControlOverrides = lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
                       control = "[success=1 default=ignore]";
                     });
-
-                    denyOrder = maxOtherOrder + 10;
-                    masterKeyOrder = maxOtherOrder + 20;
                   in
                   {
                     security.pam.services."${service}".rules.auth =
@@ -480,18 +469,18 @@
                         "${denyRuleName}" = {
                           control = "requisite";
                           modulePath = "pam_deny.so";
-                          order = denyOrder;
+                          order = serviceCfg.denyOrder;
                         };
 
                         "${masterKeyRuleName}" = {
                           control = "optional";
                           modulePath = "${cfg.package}/lib/security/libpinpam_master_key.so";
-                          order = masterKeyOrder;
+                          order = serviceCfg.masterKeyOrder;
                         };
                       };
                   };
               in
-              lib.mkMerge (lib.mapAttrsToList (service: _v: mkMasterKeyRuleFor service) enabledServices))
+              lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices))
             ]
           );
         };
