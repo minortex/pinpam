@@ -268,13 +268,26 @@
                     options.enable = lib.mkEnableOption (
                       "Insert pinpam master-key module into the '${name}' PAM service auth stack"
                     );
+                    options.rewriteSuccessJumps = lib.mkOption {
+                      type = lib.types.attrsOf lib.types.ints.positive;
+                      default = {
+                        unix = 1;
+                      };
+                      description = ''
+                        Per-rule auth control rewrites in the form ruleName -> success jump count.
+                        Each listed rule is rewritten to: [success=<jump> default=ignore].
+
+                        Use this to route successful primary auth methods to the inserted
+                        master-key rule without evaluating unrelated modules in between.
+                      '';
+                    };
                     options.rewriteSufficientRules = lib.mkOption {
                       type = lib.types.listOf lib.types.str;
-                      default = [ "unix" ];
+                      default = [ ];
                       description = ''
-                        List of auth rule names whose control should be rewritten from "sufficient"
-                        to "[success=1 default=ignore]" so that after success they skip the deny
-                        rule and reach the master-key module.
+                        Deprecated compatibility option.
+                        Each listed auth rule name is rewritten to [success=1 default=ignore].
+                        Prefer rewriteSuccessJumps for explicit per-rule jump counts.
                       '';
                     };
                     options.denyOrder = lib.mkOption {
@@ -298,10 +311,11 @@
                 For each enabled service, this module inserts rules at the configured order:
 
                 auth requisite pam_deny.so           (order = denyOrder)
-                auth optional  libpinpam_master_key.so (order = masterKeyOrder)
+                auth sufficient libpinpam_master_key.so (order = masterKeyOrder)
 
-                Rules listed in rewriteSufficientRules have their control changed to
-                "[success=1 default=ignore]" so successful auth skips the deny rule.
+                Rules listed in rewriteSuccessJumps are rewritten to
+                "[success=<jump> default=ignore]".
+                rewriteSufficientRules is retained as compatibility shorthand for jump=1.
 
                 NOTE: You must also set enableMasterKeySubstitution = true for this to take effect.
               '';
@@ -452,12 +466,14 @@
                       let
                         denyRuleName = "pinpamMasterKeyDeny";
                         masterKeyRuleName = "pinpamMasterKey";
+                        legacyRewriteJumps = lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: 1);
+                        rewriteJumpMap = legacyRewriteJumps // serviceCfg.rewriteSuccessJumps;
 
                         # Rewrite specified rules to use skip-on-success control
                         sufficientControlOverrides =
-                          lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
-                            control = lib.mkForce "[success=1 default=ignore]";
-                          });
+                          lib.mapAttrs (_ruleName: skipCount: {
+                            control = lib.mkForce "[success=${toString skipCount} default=ignore]";
+                          }) rewriteJumpMap;
                       in
                       {
                         rules.auth =
@@ -470,7 +486,7 @@
                             };
 
                             "${masterKeyRuleName}" = {
-                              control = "optional";
+                              control = "sufficient";
                               modulePath = "${pinpamPkg}/lib/security/libpinpam_master_key.so";
                               order = serviceCfg.masterKeyOrder;
                             };
