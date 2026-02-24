@@ -279,12 +279,12 @@
                     };
                     options.denyOrder = lib.mkOption {
                       type = lib.types.int;
-                      default = 9900;
-                      description = "Order for the pam_deny.so rule inserted before master-key.";
+                      default = 13000;
+                      description = "Order for the pam_deny.so rule inserted before master-key (after rewritten sufficient rules).";
                     };
                     options.masterKeyOrder = lib.mkOption {
                       type = lib.types.int;
-                      default = 9910;
+                      default = 13010;
                       description = "Order for the libpinpam_master_key.so rule.";
                     };
                   }
@@ -456,7 +456,7 @@
                         # Rewrite specified rules to use skip-on-success control
                         sufficientControlOverrides =
                           lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
-                            control = lib.mkOverride 1000 "[success=1 default=ignore]";
+                            control = lib.mkForce "[success=1 default=ignore]";
                           });
                       in
                       {
