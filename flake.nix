@@ -419,9 +419,9 @@
               })
 
               # Append master-key auth module to selected PAM services
-              # Guarded by explicit boolean to avoid evaluating substituteMasterKeyAuth attrset
-              (lib.mkIf cfg.enableMasterKeySubstitution (
-                let
+              # Guarded by plain if/else to avoid evaluating substituteMasterKeyAuth when disabled
+              (if cfg.enableMasterKeySubstitution then
+                (let
                   enabledServices = lib.filterAttrs (
                     _service: serviceCfg:
                     (serviceCfg.enable or false)
@@ -455,8 +455,9 @@
                       };
                   };
                 in
-                lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices)
-              ))
+                lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices))
+              else
+                { })
             ]
           );
         };
