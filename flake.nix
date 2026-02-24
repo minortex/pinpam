@@ -19,6 +19,72 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
+
+      mkPinpamPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "pinpam";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            clang
+            llvm
+          ];
+
+          buildInputs = with pkgs; [
+            linux-pam
+            tpm2-tss.dev
+            openssl
+            libclang.lib
+          ];
+
+          # Set environment variables for building
+          OPENSSL_NO_VENDOR = 1;
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.linux-pam}/lib/pkgconfig:${pkgs.tpm2-tss.dev}/lib/pkgconfig";
+
+          buildPhase = ''
+            runHook preBuild
+
+            # Build the workspace
+            cargo build --release --workspace
+
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+
+            # Install PAM module (shared library from pinpam-pam crate)
+            mkdir -p $out/lib/security
+            cp target/release/libpinpam.so $out/lib/security/
+            cp target/release/libpinpam_master_key.so $out/lib/security/
+
+            # Install pinutil binary
+            mkdir -p $out/bin
+            cp target/release/pinutil $out/bin/
+
+            runHook postInstall
+          '';
+          phases = [
+            "unpackPhase"
+            "buildPhase"
+            "installPhase"
+          ];
+
+          meta = with pkgs.lib; {
+            description = "TPM-backed PIN authentication PAM module";
+            license = licenses.mit;
+            platforms = platforms.linux;
+            maintainers = [ ];
+          };
+        };
       forEachSupportedSystem =
         f:
         nixpkgs.lib.genAttrs supportedSystems (
@@ -35,69 +101,7 @@
       packages = forEachSupportedSystem (
         { pkgs }:
         {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "pinpam";
-            version = "0.1.0";
-
-            src = ./.;
-
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              clang
-              llvm
-            ];
-
-            buildInputs = with pkgs; [
-              linux-pam
-              tpm2-tss.dev
-              openssl
-              libclang.lib
-            ];
-
-            # Set environment variables for building
-            OPENSSL_NO_VENDOR = 1;
-            PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.linux-pam}/lib/pkgconfig:${pkgs.tpm2-tss.dev}/lib/pkgconfig";
-
-            buildPhase = ''
-              runHook preBuild
-
-              # Build the workspace
-              cargo build --release --workspace
-
-              runHook postBuild
-            '';
-
-            installPhase = ''
-              runHook preInstall
-
-              # Install PAM module (shared library from pinpam-pam crate)
-              mkdir -p $out/lib/security
-              cp target/release/libpinpam.so $out/lib/security/
-              cp target/release/libpinpam_master_key.so $out/lib/security/
-
-              # Install pinutil binary
-              mkdir -p $out/bin
-              cp target/release/pinutil $out/bin/
-
-              runHook postInstall
-            '';
-            phases = [
-              "unpackPhase"
-              "buildPhase"
-              "installPhase"
-            ];
-
-            meta = with pkgs.lib; {
-              description = "TPM-backed PIN authentication PAM module";
-              license = licenses.mit;
-              platforms = platforms.linux;
-              maintainers = [ ];
-            };
-          };
+          default = mkPinpamPackage pkgs;
         }
       );
 
@@ -109,23 +113,24 @@
           ...
         }:
         let
+          cfg = config.security.pinpam;
+
           # Bind individual leaves to avoid forcing evaluation of the whole security.pinpam subtree
-          pinpamEnable = config.security.pinpam.enable;
-          pinpamPkg = config.security.pinpam.package;
-          enableTpmAccess = config.security.pinpam.enableTpmAccess;
-          enableSudoPin = config.security.pinpam.enableSudoPin;
-          enableLoginPin = config.security.pinpam.enableLoginPin;
-          enableKdePin = config.security.pinpam.enableKdePin;
-          enableSystemAuthPin = config.security.pinpam.enableSystemAuthPin;
-          enableHyprlockPin = config.security.pinpam.enableHyprlockPin;
-          enablePolkitPin = config.security.pinpam.enablePolkitPin;
-          pinutilPath = config.security.pinpam.pinutilPath;
-          policyFile = config.security.pinpam.policyFile;
-          pinPolicyMinLength = config.security.pinpam.pinPolicy.minLength;
-          pinPolicyMaxLength = config.security.pinpam.pinPolicy.maxLength;
-          pinPolicyMaxAttempts = config.security.pinpam.pinPolicy.maxAttempts;
-          enableMasterKeySubstitution = config.security.pinpam.enableMasterKeySubstitution;
-          substituteMasterKeyAuth = config.security.pinpam.substituteMasterKeyAuth;
+          pinpamEnable = cfg.enable;
+          pinpamPkg = cfg.package;
+          enableTpmAccess = cfg.enableTpmAccess;
+          enableSudoPin = cfg.enableSudoPin;
+          enableLoginPin = cfg.enableLoginPin;
+          enableKdePin = cfg.enableKdePin;
+          enableSystemAuthPin = cfg.enableSystemAuthPin;
+          enableHyprlockPin = cfg.enableHyprlockPin;
+          enablePolkitPin = cfg.enablePolkitPin;
+          pinutilPath = cfg.pinutilPath;
+          policyFile = cfg.policyFile;
+          pinPolicyMinLength = cfg.pinPolicy.minLength;
+          pinPolicyMaxLength = cfg.pinPolicy.maxLength;
+          pinPolicyMaxAttempts = cfg.pinPolicy.maxAttempts;
+          enableMasterKeySubstitution = cfg.enableMasterKeySubstitution;
         in
         {
           options.security.pinpam = {
@@ -133,7 +138,7 @@
 
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
+              default = mkPinpamPackage pkgs;
               description = "The pinpam package to use";
             };
 
@@ -435,45 +440,45 @@
               })
 
               # Append master-key auth module to selected PAM services
-              # Guarded by plain if/else to avoid evaluating substituteMasterKeyAuth when disabled
-              (if enableMasterKeySubstitution then
-                (let
-                  enabledServices = lib.filterAttrs (
-                    _service: serviceCfg:
-                    (serviceCfg.enable or false)
-                  ) substituteMasterKeyAuth;
-
-                  mkMasterKeyRuleFor = service: serviceCfg:
+              (lib.mkIf enableMasterKeySubstitution {
+                security.pam.services =
                   let
-                    denyRuleName = "pinpamMasterKeyDeny";
-                    masterKeyRuleName = "pinpamMasterKey";
+                    enabledServices = lib.filterAttrs (
+                      _service: serviceCfg:
+                      (serviceCfg.enable or false)
+                    ) cfg.substituteMasterKeyAuth;
 
-                    # Rewrite specified rules to use skip-on-success control
-                    sufficientControlOverrides = lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
-                      control = "[success=1 default=ignore]";
-                    });
-                  in
-                  {
-                    security.pam.services."${service}".rules.auth =
-                      sufficientControlOverrides
-                      // {
-                        "${denyRuleName}" = {
-                          control = "requisite";
-                          modulePath = "pam_deny.so";
-                          order = serviceCfg.denyOrder;
-                        };
+                    mkService = service: serviceCfg:
+                      let
+                        denyRuleName = "pinpamMasterKeyDeny";
+                        masterKeyRuleName = "pinpamMasterKey";
 
-                        "${masterKeyRuleName}" = {
-                          control = "optional";
-                          modulePath = "${pinpamPkg}/lib/security/libpinpam_master_key.so";
-                          order = serviceCfg.masterKeyOrder;
-                        };
+                        # Rewrite specified rules to use skip-on-success control
+                        sufficientControlOverrides =
+                          lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
+                            control = "[success=1 default=ignore]";
+                          });
+                      in
+                      {
+                        rules.auth =
+                          sufficientControlOverrides
+                          // {
+                            "${denyRuleName}" = {
+                              control = "requisite";
+                              modulePath = "pam_deny.so";
+                              order = serviceCfg.denyOrder;
+                            };
+
+                            "${masterKeyRuleName}" = {
+                              control = "optional";
+                              modulePath = "${pinpamPkg}/lib/security/libpinpam_master_key.so";
+                              order = serviceCfg.masterKeyOrder;
+                            };
+                          };
                       };
-                  };
-                in
-                lib.mkMerge (lib.mapAttrsToList mkMasterKeyRuleFor enabledServices))
-              else
-                { })
+                  in
+                  lib.mapAttrs mkService enabledServices;
+              })
             ]
           );
         };
