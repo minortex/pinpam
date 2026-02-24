@@ -7,13 +7,59 @@
 use libc::{c_char, c_int, c_void};
 use log::{error, info, warn};
 use pam_sys::{raw, types::PamItemType, types::PamReturnCode};
+use pinpam_core::{pinerror::PinError, pinpolicy::PinPolicy};
 use std::{
 	env,
 	ffi::{CStr, CString},
+	path::Path,
+	process::{Command, Stdio},
 	ptr,
 	sync::OnceLock,
 };
 use syslog::{BasicLogger, Facility, Formatter3164};
+
+fn pin_policy() -> &'static PinPolicy {
+	static POLICY: OnceLock<PinPolicy> = OnceLock::new();
+	POLICY.get_or_init(PinPolicy::load_from_standard_locations)
+}
+
+fn pinutil_path() -> &'static Path {
+	&pin_policy().pinutil_path
+}
+
+fn derive_user_token_via_pinutil(username: &str) -> Result<String, String> {
+	let pinutil = pinutil_path();
+	let output = Command::new(pinutil)
+		.arg("-m")
+		.arg("master-key")
+		.arg("get-user-token")
+		.arg(username)
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.output()
+		.map_err(|e| format!("failed to execute pinutil via {}: {}", pinutil.display(), e))?;
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	if !output.status.success() {
+		return Err(format!(
+			"pinutil exited with {}: {}",
+			output.status,
+			stderr.trim()
+		));
+	}
+
+	let result = serde_json::from_str::<Result<String, PinError>>(&stdout).map_err(|e| {
+		format!(
+			"pinutil output isn't valid JSON or is malformed: {e}; stdout='{}' stderr='{}'",
+			stdout.trim(),
+			stderr.trim()
+		)
+	})?;
+
+	result.map_err(|e| format!("pinutil returned an error: {e}"))
+}
 
 fn init_logging() {
 	static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -119,7 +165,7 @@ pub extern "C" fn pam_sm_authenticate(
 	};
 
 	// Derive token and replace AUTHTOK. Never log the token.
-	let token = match pinpam_core::master_key::derive_user_token(&user) {
+	let token = match derive_user_token_via_pinutil(&user) {
 		Ok(t) => t,
 		Err(e) => {
 			error!("failed to derive master-key token for user '{user}': {e}");
