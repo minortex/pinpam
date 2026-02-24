@@ -281,6 +281,17 @@
 
                 Rules listed in rewriteSufficientRules have their control changed to
                 "[success=1 default=ignore]" so successful auth skips the deny rule.
+
+                NOTE: You must also set enableMasterKeySubstitution = true for this to take effect.
+              '';
+            };
+
+            enableMasterKeySubstitution = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                Master switch to enable master-key PAM substitution.
+                Set this to true and configure substituteMasterKeyAuth for the desired services.
               '';
             };
           };
@@ -408,9 +419,8 @@
               })
 
               # Append master-key auth module to selected PAM services
-              # Guard: only evaluate when user has configured at least one service
-              # Using builtins.attrNames avoids forcing attrset values which would cause recursion
-              (lib.mkIf (builtins.attrNames cfg.substituteMasterKeyAuth != []) (
+              # Guarded by explicit boolean to avoid evaluating substituteMasterKeyAuth attrset
+              (lib.mkIf cfg.enableMasterKeySubstitution (
                 let
                   enabledServices = lib.filterAttrs (
                     _service: serviceCfg:
