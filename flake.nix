@@ -195,7 +195,8 @@
 
             pinutilPath = lib.mkOption {
               type = lib.types.str;
-              default = "${toString config.security.wrapperDir}/pinutil";
+              default = "/run/wrappers/bin/pinutil";
+              defaultText = lib.literalExpression ''"\${config.security.wrapperDir}/pinutil"'';
               description = ''
                 Absolute path to the trusted pinutil binary. This value is embedded into the
                 generated PIN policy to ensure pinpam only invokes the expected executable.
@@ -357,7 +358,7 @@
                 security.pam.services.sudo.rules.auth.pinpam = {
                   control = "sufficient";
                   modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.sudo.rules.auth.unix.order - 10;
+                  order = 11050;  # Default unix order is 11100, place before it
                 };
               })
 
@@ -366,7 +367,7 @@
                 security.pam.services.login.rules.auth.pinpam = {
                   control = "sufficient";
                   modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.login.rules.auth.unix.order - 10;
+                  order = 11050;
                 };
               })
               # KDE PAM configuration
@@ -374,55 +375,21 @@
                 security.pam.services.kde.rules.auth.pinpam = {
                   control = "sufficient";
                   modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.kde.rules.auth.unix.order - 10;
+                  order = 11050;
                 };
               })
               (lib.mkIf cfg.enableSystemAuthPin {
-                security.pam.services."system-auth".rules.auth.pinpam =
-                  let
-                    unixOrder = lib.attrByPath [
-                      "security"
-                      "pam"
-                      "services"
-                      "system-auth"
-                      "rules"
-                      "auth"
-                      "unix"
-                      "order"
-                    ] null config;
-                  in
-                  {
-                    control = "sufficient";
-                    modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                    order = if unixOrder != null then unixOrder - 10 else 110;
-                  };
-              })
-
-              (lib.mkIf cfg.enableLoginPin {
-                security.pam.services.login.rules.auth.pinpam =
-                  let
-                    unixOrder = lib.attrByPath [
-                      "security"
-                      "pam"
-                      "services"
-                      "login"
-                      "rules"
-                      "auth"
-                      "unix"
-                      "order"
-                    ] null config;
-                  in
-                  {
-                    control = "sufficient";
-                    modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                    order = if unixOrder != null then unixOrder - 10 else 110;
-                  };
+                security.pam.services."system-auth".rules.auth.pinpam = {
+                  control = "sufficient";
+                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                  order = 11050;
+                };
               })
 
               (lib.mkIf cfg.enableHyprlockPin {
                 security.pam.services.hyprlock.rules.auth.pinpam = {
                   control = "sufficient";
-                  order = config.security.pam.services.hyprlock.rules.auth.unix.order - 10;
+                  order = 11050;
                   modulePath = "${cfg.package}/lib/security/libpinpam.so";
                 };
               })
@@ -430,7 +397,7 @@
               (lib.mkIf cfg.enablePolkitPin {
                 security.pam.services.polkit-1.rules.auth.pinpam = {
                   control = "sufficient";
-                  order = config.security.pam.services.polkit-1.rules.auth.unix.order - 10;
+                  order = 11050;
                   modulePath = "${cfg.package}/lib/security/libpinpam.so";
                 };
               })
