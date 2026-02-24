@@ -456,7 +456,7 @@
                         # Rewrite specified rules to use skip-on-success control
                         sufficientControlOverrides =
                           lib.genAttrs serviceCfg.rewriteSufficientRules (_ruleName: {
-                            control = "[success=1 default=ignore]";
+                            control = lib.mkOverride 1000 "[success=1 default=ignore]";
                           });
                       in
                       {
