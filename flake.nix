@@ -131,6 +131,9 @@
               catchDenyOrder = denyAnchorOrder - 40;
               masterKeyOrder = denyAnchorOrder - 30;
 
+              successRuleNames = lib.unique serviceCfg.successRules;
+              serviceAuthRules = lib.attrByPath [ _service "rules" "auth" ] { } config.security.pam.services;
+
               presentPostRules =
                 lib.unique serviceCfg.postAuthRules;
 
@@ -144,15 +147,50 @@
 
               permitOrder = masterKeyOrder + 1 + (builtins.length presentPostRules);
 
+              getRuleOrder = ruleName:
+                lib.attrByPath [ ruleName "order" ] null serviceAuthRules;
+
+              getSuccessJumpOffset = ruleName:
+                let
+                  ruleOrder = getRuleOrder ruleName;
+                  allRuleOrders =
+                    lib.unique (
+                      lib.filter (order: order != null) (
+                        (lib.mapAttrsToList (
+                          _name: rule:
+                          let
+                            ruleEnabled = if rule ? enable then rule.enable else true;
+                          in
+                          if ruleEnabled && rule ? order then
+                            rule.order
+                          else
+                            null
+                        ) serviceAuthRules)
+                        ++ [ catchDenyOrder ]
+                      )
+                    );
+                in
+                if ruleOrder == null || ruleOrder >= masterKeyOrder then
+                  null
+                else
+                  builtins.length (lib.filter (order: order > ruleOrder && order < masterKeyOrder) allRuleOrders);
+
               successControlOverrides =
                 lib.listToAttrs (
                   map (
                     ruleName:
                     lib.nameValuePair ruleName {
-                      control = lib.mkForce "[success=ok default=ignore]";
+                      control =
+                        let
+                          jumpOffset = getSuccessJumpOffset ruleName;
+                        in
+                        if jumpOffset == null then
+                          lib.mkForce "[success=ok default=ignore]"
+                        else
+                          lib.mkForce "[success=${toString jumpOffset} default=ignore]";
                     }
                   )
-                    (lib.unique serviceCfg.successRules)
+                    successRuleNames
                 );
 
               postRuleOrderOverrides =
