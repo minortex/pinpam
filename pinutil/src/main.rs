@@ -126,28 +126,44 @@ fn main() -> PinResult<()> {
         Commands::Status { username } => {
             handle_result(show_status(&resolve_username(username)?, machine), machine)
         }
-        Commands::MasterKey(cmd) => match cmd {
-            MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
-            MasterKeyCommands::Status => handle_result(master_key_status(machine), machine),
-            MasterKeyCommands::ImportToTpm => handle_result(master_key_import_to_tpm(machine), machine),
-            MasterKeyCommands::ClearFromTpm => handle_result(master_key_clear_from_tpm(machine), machine),
-            MasterKeyCommands::ClearFromDisk => handle_result(master_key_clear_from_disk(machine), machine),
-            MasterKeyCommands::GetUserToken { username } => {
-                if machine {
-                    handle_result(master_key_get_user_token(&username), machine)
-                } else {
-                    // Human mode must print the token.
-                    match master_key_get_user_token(&username) {
-                        Ok(token) => println!("{token}"),
-                        Err(e) => {
-                            eprintln!("{}", t!("error_result", "error" => e));
-                            std::process::exit(1);
+        Commands::MasterKey(cmd) => {
+            handle_result(require_root(), machine);
+            match cmd {
+                MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
+                MasterKeyCommands::Status => handle_result(master_key_status(machine), machine),
+                MasterKeyCommands::ImportToTpm => {
+                    handle_result(master_key_import_to_tpm(machine), machine)
+                }
+                MasterKeyCommands::ClearFromTpm => {
+                    handle_result(master_key_clear_from_tpm(machine), machine)
+                }
+                MasterKeyCommands::ClearFromDisk => {
+                    handle_result(master_key_clear_from_disk(machine), machine)
+                }
+                MasterKeyCommands::GetUserToken { username } => {
+                    if machine {
+                        handle_result(master_key_get_user_token(&username), machine)
+                    } else {
+                        // Human mode must print the token.
+                        match master_key_get_user_token(&username) {
+                            Ok(token) => println!("{token}"),
+                            Err(e) => {
+                                eprintln!("{}", t!("error_result", "error" => e));
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
             }
-        },
+        }
     };
+    Ok(())
+}
+
+fn require_root() -> PinResult<()> {
+    if get_uid() != 0 {
+        return Err(PinError::PermissionDenied);
+    }
     Ok(())
 }
 

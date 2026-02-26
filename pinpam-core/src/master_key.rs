@@ -4,7 +4,7 @@ use crate::pinconstants::{
 use crate::pinerror::{PinError, PinResult};
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{consts::U12, Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -378,8 +378,9 @@ fn seal_key_bytes_to_path(key_bytes: &[u8; HMAC_KEY_LEN], phrase: &str, path: &P
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| PinError::IoError(e.to_string()))?;
 
+    let nonce_ga = Nonce::<U12>::from(nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), key_bytes.as_slice())
+        .encrypt(&nonce_ga, key_bytes.as_slice())
         .map_err(|e| PinError::IoError(e.to_string()))?;
 
     let sealed = SealedMasterKeyFile {
@@ -434,8 +435,9 @@ fn unseal_key_bytes_from_path(phrase: &str, path: &Path) -> PinResult<Vec<u8>> {
         .map_err(|e| PinError::IoError(e.to_string()))?;
     let mut nonce_arr = [0u8; 12];
     nonce_arr.copy_from_slice(&nonce);
+    let nonce_ga = Nonce::<U12>::from(nonce_arr);
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_arr), ciphertext.as_slice())
+        .decrypt(&nonce_ga, ciphertext.as_slice())
         .map_err(|e| PinError::IoError(e.to_string()))?;
     Ok(plaintext)
 }
