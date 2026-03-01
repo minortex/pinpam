@@ -128,7 +128,7 @@ fn main() -> PinResult<()> {
         }
         Commands::MasterKey(cmd) => {
             if let Err(e) = require_root() {
-                handle_result(Err(e), machine);
+                handle_result::<()>(Err(e), machine);
             }
             match cmd {
                 MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
