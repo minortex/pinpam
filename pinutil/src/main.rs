@@ -127,7 +127,9 @@ fn main() -> PinResult<()> {
             handle_result(show_status(&resolve_username(username)?, machine), machine)
         }
         Commands::MasterKey(cmd) => {
-            handle_result(require_root(), machine);
+            if let Err(e) = require_root() {
+                handle_result(Err(e), machine);
+            }
             match cmd {
                 MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
                 MasterKeyCommands::Status => handle_result(master_key_status(machine), machine),
