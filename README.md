@@ -2,6 +2,10 @@
 
 pinpam is a PAM module and credential utility to enable system-wide authentication with a secure TPM2-backed pin.
 
+See this blog post for cool information and some insights into the design decisions:
+
+- [ Greasing Linux Auth : Hardware-Backed Auth with PAM + TPM2 ](https://blog.prizrak.me/post/pam_tpm/)
+
 # Updates
 
 - v0.0.3 : fix policy access right TOCTOU (credit to nbdd0121), add landlock sandboxing, disallow ./policy as policy source.
