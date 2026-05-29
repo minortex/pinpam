@@ -11,19 +11,21 @@ use pam_sys::{
     },
 };
 use pinpam_core::{
-    pindata::AttemptInfo, pinerror::PinError, pinpolicy::PinPolicy, util::get_uid_from_username,
+    pamlog::{init_syslog_logger, suppress_tss_logs},
+    pin::Pin,
+    pindata::AttemptInfo,
+    pinerror::PinError,
+    pinpolicy::PinPolicy,
+    util::get_uid_from_username,
 };
 use std::{
-    env,
     ffi::{CStr, CString},
     io::{self, Write},
     os::raw::{c_char, c_int},
     path::Path,
-    process::{self, Command, Stdio},
+    process::{Command, Stdio},
     ptr,
-    sync::OnceLock,
 };
-use syslog::{BasicLogger, Facility, Formatter3164};
 
 #[macro_use]
 extern crate rust_i18n;
@@ -83,13 +85,8 @@ impl From<Result<(), PinError>> for PinutilTestOutcome {
     }
 }
 
-fn pin_policy() -> &'static PinPolicy {
-    static POLICY: OnceLock<PinPolicy> = OnceLock::new();
-    POLICY.get_or_init(PinPolicy::load_from_standard_locations)
-}
-
 fn pinutil_path() -> &'static Path {
-    &pin_policy().pinutil_path
+    &PinPolicy::cached().pinutil_path
 }
 
 fn run_pinutil_status(username: &str) -> PinStatus {
@@ -142,7 +139,7 @@ fn run_pinutil_status(username: &str) -> PinStatus {
     }
 }
 
-fn run_pinutil_test(username: &str, pin: &str) -> Result<PinutilTestOutcome, String> {
+fn run_pinutil_test(username: &str, pin: &Pin) -> Result<PinutilTestOutcome, String> {
     let pinutil = pinutil_path();
     let mut child = Command::new(pinutil)
         .arg("-m")
@@ -165,7 +162,7 @@ fn run_pinutil_test(username: &str, pin: &str) -> Result<PinutilTestOutcome, Str
         .take()
         .ok_or_else(|| "failed to open stdin pipe to pinutil".to_string())?;
 
-    if let Err(err) = writeln!(child_stdin, "{}", pin) {
+    if let Err(err) = writeln!(child_stdin, "{}", pin.as_str()) {
         if err.kind() != io::ErrorKind::BrokenPipe {
             return Err(format!("failed to send PIN to pinutil: {}", err));
         }
@@ -198,134 +195,48 @@ fn run_pinutil_test(username: &str, pin: &str) -> Result<PinutilTestOutcome, Str
 }
 
 fn init_logging() {
-    static LOGGER_INIT: OnceLock<()> = OnceLock::new();
-    LOGGER_INIT.get_or_init(|| {
-        // Route log crate output to syslog's authpriv facility; fall back to env_logger on failure.
-        let rust_log = env::var("RUST_LOG").ok();
-
-        let mut env_builder = env_logger::Builder::new();
-        env_builder.filter_level(log::LevelFilter::Info);
-        if let Some(ref value) = rust_log {
-            env_builder.parse_filters(value);
-        }
-
-        let max_level = rust_log
-            .as_deref()
-            .map(|value| {
-                if value.contains('=') || value.contains(',') {
-                    log::LevelFilter::Trace
-                } else {
-                    value
-                        .parse::<log::LevelFilter>()
-                        .unwrap_or(log::LevelFilter::Trace)
-                }
-            })
-            .unwrap_or(log::LevelFilter::Info);
-
-        let formatter = Formatter3164 {
-            facility: Facility::LOG_AUTHPRIV,
-            hostname: None,
-            process: "pinpam".to_owned(),
-            pid: process::id(),
-        };
-
-        if let Ok(writer) = syslog::unix(formatter) {
-            if log::set_boxed_logger(Box::new(BasicLogger::new(writer))).is_ok() {
-                log::set_max_level(max_level);
-                return;
-            }
-        }
-
-        let _ = env_builder.try_init();
-    });
+    init_syslog_logger("pinpam");
 }
 
-fn suppress_tss_logs() {
-    static SUPPRESS_LOGS: OnceLock<()> = OnceLock::new();
-    SUPPRESS_LOGS.get_or_init(|| {
-        if env::var_os("RUST_LOG").is_none() {
-            env::set_var("TSS2_LOG", "all+NONE");
-        }
-    });
-}
-
+/// Safe wrapper around the PAM conversation function pointer.
+///
+/// The invariant that `conv` is non-null and points to a live `PamConversation`
+/// owned by the PAM stack is established by [`PamIo::new`] (the only `unsafe`
+/// constructor) and relied on by the safe methods below.
 struct PamIo {
     conv: *const PamConversation,
 }
 
 impl PamIo {
-    unsafe fn new(pamh: *mut pam_sys::PamHandle) -> PamResult<Self> {
+    fn new(pamh: *mut pam_sys::PamHandle) -> PamResult<Self> {
         let mut item_ptr: *const c_void = ptr::null();
-        let status = PamReturnCode::from(raw::pam_get_item(
-            pamh,
-            PamItemType::CONV as c_int,
-            &mut item_ptr,
-        ));
+        // SAFETY: PAM contract: `pamh` is valid for the call; `item_ptr` is a
+        // local out-parameter that PAM populates.
+        let status = PamReturnCode::from(unsafe {
+            raw::pam_get_item(pamh, PamItemType::CONV as c_int, &mut item_ptr)
+        });
 
         if status != PamReturnCode::SUCCESS {
             return Err(status);
         }
-
         if item_ptr.is_null() {
             return Err(PamReturnCode::CONV_ERR);
         }
-
-        let conv = item_ptr as *const PamConversation;
-        if conv.is_null() {
-            return Err(PamReturnCode::CONV_ERR);
-        }
-
-        Ok(Self { conv })
+        Ok(Self {
+            conv: item_ptr as *const PamConversation,
+        })
     }
 
-    unsafe fn prompt_hidden(&self, prompt: &str) -> PamResult<String> {
-        let conv_struct = &*self.conv;
-        let conv_fn = conv_struct.conv.ok_or(PamReturnCode::CONV_ERR)?;
-        let prompt_cstr = CString::new(prompt).map_err(|_| PamReturnCode::SYSTEM_ERR)?;
-
-        let mut message = PamMessage {
-            msg_style: PamMessageStyle::PROMPT_ECHO_OFF as c_int,
-            msg: prompt_cstr.as_ptr(),
-        };
-
-        let mut message_ptrs = [&mut message as *mut PamMessage];
-        let mut response_ptr: *mut PamResponse = ptr::null_mut();
-
-        let status = PamReturnCode::from(conv_fn(
-            message_ptrs.len() as c_int,
-            message_ptrs.as_mut_ptr(),
-            &mut response_ptr,
-            conv_struct.data_ptr,
-        ));
-
-        if status != PamReturnCode::SUCCESS {
-            return Err(status);
-        }
-
-        if response_ptr.is_null() {
-            return Err(PamReturnCode::CONV_ERR);
-        }
-
-        let response = *response_ptr;
-        let result = if response.resp.is_null() {
-            Err(PamReturnCode::CONV_ERR)
-        } else {
-            CStr::from_ptr(response.resp)
-                .to_str()
-                .map(|s| s.trim().to_owned())
-                .map_err(|_| PamReturnCode::AUTH_ERR)
-        };
-
-        if !response.resp.is_null() {
-            libc::free(response.resp as *mut c_void);
-        }
-        libc::free(response_ptr as *mut c_void);
-
-        result
-    }
-
-    unsafe fn send_message(&self, style: PamMessageStyle, text: &str) -> PamResult<()> {
-        let conv_struct = &*self.conv;
+    /// Dispatch a single PAM message through the conversation function and
+    /// return the response pointer for the caller to consume.
+    fn converse(
+        &self,
+        style: PamMessageStyle,
+        text: &str,
+    ) -> PamResult<*mut PamResponse> {
+        // SAFETY: `self.conv` is non-null and stable for the lifetime of `self`
+        // (established in `PamIo::new`).
+        let conv_struct = unsafe { &*self.conv };
         let conv_fn = conv_struct.conv.ok_or(PamReturnCode::CONV_ERR)?;
         let text_cstr = CString::new(text).map_err(|_| PamReturnCode::SYSTEM_ERR)?;
 
@@ -333,10 +244,12 @@ impl PamIo {
             msg_style: style as c_int,
             msg: text_cstr.as_ptr(),
         };
-
         let mut message_ptrs = [&mut message as *mut PamMessage];
         let mut response_ptr: *mut PamResponse = ptr::null_mut();
 
+        // `conv_fn` is `extern "C" fn` (not `unsafe extern "C" fn`), so the
+        // call itself is safe. Its raw-pointer arguments are owned by us and
+        // remain valid for the duration of the call.
         let status = PamReturnCode::from(conv_fn(
             message_ptrs.len() as c_int,
             message_ptrs.as_mut_ptr(),
@@ -347,8 +260,51 @@ impl PamIo {
         if status != PamReturnCode::SUCCESS {
             return Err(status);
         }
+        Ok(response_ptr)
+    }
 
-        if !response_ptr.is_null() {
+    fn prompt_hidden(&self, prompt: &str) -> PamResult<String> {
+        let response_ptr = self.converse(PamMessageStyle::PROMPT_ECHO_OFF, prompt)?;
+        if response_ptr.is_null() {
+            return Err(PamReturnCode::CONV_ERR);
+        }
+
+        // SAFETY: PAM successfully filled `response_ptr` with a heap-allocated
+        // `PamResponse`; we own it and must free it before returning.
+        let response = unsafe { *response_ptr };
+
+        let result = if response.resp.is_null() {
+            Err(PamReturnCode::CONV_ERR)
+        } else {
+            // SAFETY: `response.resp` is non-null and points to a
+            // NUL-terminated C string allocated by the conversation function.
+            let cstr = unsafe { CStr::from_ptr(response.resp) };
+            cstr.to_str()
+                .map(|s| s.trim().to_owned())
+                .map_err(|_| PamReturnCode::AUTH_ERR)
+        };
+
+        // SAFETY: The PAM ABI requires the caller to libc::free the response
+        // payload and the array itself.
+        unsafe {
+            if !response.resp.is_null() {
+                libc::free(response.resp as *mut c_void);
+            }
+            libc::free(response_ptr as *mut c_void);
+        }
+
+        result
+    }
+
+    fn send_message(&self, style: PamMessageStyle, text: &str) -> PamResult<()> {
+        let response_ptr = self.converse(style, text)?;
+        if response_ptr.is_null() {
+            return Ok(());
+        }
+
+        // SAFETY: `response_ptr` is non-null; PAM owns the contents and we
+        // must libc::free both the inner string and the response struct.
+        unsafe {
             let response = *response_ptr;
             if !response.resp.is_null() {
                 libc::free(response.resp as *mut c_void);
@@ -359,17 +315,16 @@ impl PamIo {
         Ok(())
     }
 
-    unsafe fn info(&self, text: &str) -> PamResult<()> {
+    fn info(&self, text: &str) -> PamResult<()> {
         self.send_message(PamMessageStyle::TEXT_INFO, text)
     }
 
-    unsafe fn error(&self, text: &str) -> PamResult<()> {
+    fn error(&self, text: &str) -> PamResult<()> {
         self.send_message(PamMessageStyle::ERROR_MSG, text)
     }
 }
 
-/// Get username from PAM handle
-unsafe fn get_username(pamh: *mut pam_sys::PamHandle) -> PamResult<String> {
+fn get_username(pamh: *mut pam_sys::PamHandle) -> PamResult<String> {
     extern "C" {
         fn pam_get_user(
             pamh: *const pam_sys::PamHandle,
@@ -379,26 +334,27 @@ unsafe fn get_username(pamh: *mut pam_sys::PamHandle) -> PamResult<String> {
     }
 
     let mut user_ptr: *const c_char = ptr::null();
-    let ret = pam_get_user(pamh, &mut user_ptr, ptr::null());
-    let status = PamReturnCode::from(ret);
+    // SAFETY: PAM contract: `pamh` is valid for the call; `user_ptr` is a
+    // local out-parameter that PAM populates with a pointer it owns.
+    let status = PamReturnCode::from(unsafe { pam_get_user(pamh, &mut user_ptr, ptr::null()) });
 
     if status != PamReturnCode::SUCCESS {
         return Err(status);
     }
-
     if user_ptr.is_null() {
         return Err(PamReturnCode::USER_UNKNOWN);
     }
 
-    let username = CStr::from_ptr(user_ptr)
-        .to_str()
-        .map(|s| s.to_owned())
-        .map_err(|_| PamReturnCode::USER_UNKNOWN)?;
-
-    Ok(username)
+    // SAFETY: PAM returned a non-null pointer to a NUL-terminated string owned
+    // by the PAM stack; we copy it into an owned `String` here so the borrow
+    // does not outlive the call.
+    let cstr = unsafe { CStr::from_ptr(user_ptr) };
+    cstr.to_str()
+        .map(str::to_owned)
+        .map_err(|_| PamReturnCode::USER_UNKNOWN)
 }
 
-unsafe fn prompt_for_pin(io: &PamIo, used: u32, limit: u32) -> PamResult<String> {
+fn prompt_for_pin(io: &PamIo, used: u32, limit: u32) -> PamResult<Pin> {
     let prompt = match limit - used {
         // With at least 3 attempts remaining, just ask for the PIN with no extra warnings.
         3.. => t!("pin_prompt"),
@@ -410,19 +366,24 @@ unsafe fn prompt_for_pin(io: &PamIo, used: u32, limit: u32) -> PamResult<String>
     };
     let pin_text = io.prompt_hidden(&prompt)?;
 
-    if pin_text.is_empty() {
-        io.error(&t!("pin_empty"))?;
-        return Err(PamReturnCode::AUTH_ERR);
-    }
-    if pin_text.chars().all(|c| c.is_ascii_digit()) {
-        Ok(pin_text)
-    } else {
-        io.error(&t!("pin_digits"))?;
-        Err(PamReturnCode::AUTH_ERR)
+    match Pin::new(&pin_text, PinPolicy::cached()) {
+        Ok(pin) => Ok(pin),
+        Err(PinError::PinIsEmpty) => {
+            io.error(&t!("pin_empty"))?;
+            Err(PamReturnCode::AUTH_ERR)
+        }
+        Err(_) => {
+            io.error(&t!("pin_digits"))?;
+            Err(PamReturnCode::AUTH_ERR)
+        }
     }
 }
 
-/// PAM authentication function
+/// PAM authentication entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI. `pamh` must be a valid
+/// `pam_handle_t` and `argv` must point to `argc` valid C strings.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_authenticate(
     pamh: *mut pam_sys::PamHandle,
@@ -432,7 +393,6 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 ) -> c_int {
     init_logging();
     suppress_tss_logs();
-    // Initialize locale for translations
     rust_i18n::set_locale(locale_config::Locale::current().as_ref());
 
     let pam_io = match PamIo::new(pamh) {
@@ -442,7 +402,6 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             return code as c_int;
         }
     };
-
     let username = match get_username(pamh) {
         Ok(user) => user,
         Err(code) => {
@@ -452,106 +411,103 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         }
     };
 
+    authenticate_user(&pam_io, &username) as c_int
+}
+
+/// Safe implementation of the authentication flow. All FFI has already been
+/// resolved into owned Rust values by the entry point.
+fn authenticate_user(pam_io: &PamIo, username: &str) -> PamReturnCode {
     debug!("Authenticating user: {}", username);
 
-    let uid = match get_uid_from_username(&username) {
+    let uid = match get_uid_from_username(username) {
         Ok(uid) => uid,
         Err(_) => {
             warn!("User {} not found", username);
             let _ = pam_io.error(&t!("auth_failure"));
-            return PamReturnCode::USER_UNKNOWN as c_int;
+            return PamReturnCode::USER_UNKNOWN;
         }
     };
 
-    let (used, limit) = match run_pinutil_status(&username) {
+    let (used, limit) = match run_pinutil_status(username) {
         PinStatus::Unavailable(err) => {
             error!(
                 "Failed to query PIN status for user {} (uid: {}): {}",
                 username, uid, err
             );
             let _ = pam_io.error(&t!("pin_auth_unavail"));
-            return PamReturnCode::AUTHINFO_UNAVAIL as c_int;
+            return PamReturnCode::AUTHINFO_UNAVAIL;
         }
         PinStatus::NotProvisioned => {
             info!("No PIN set for user {} (uid: {})", username, uid);
             let _ = pam_io.info(&t!("pin_not_conf_for_user"));
-            return PamReturnCode::AUTHINFO_UNAVAIL as c_int;
+            return PamReturnCode::AUTHINFO_UNAVAIL;
         }
         PinStatus::LockedOut => {
             warn!(
                 "User {} (uid: {}) is locked out due to previous failed attempts",
                 username, uid
             );
-            if let Err(code) = pam_io.error(&t!("account_locked")) {
-                return code as c_int;
-            }
-            return PamReturnCode::MAXTRIES as c_int;
+            let _ = pam_io.error(&t!("account_locked"));
+            return PamReturnCode::MAXTRIES;
         }
         PinStatus::Available { used, limit } => (used, limit),
     };
 
-    let pin = match prompt_for_pin(&pam_io, used, limit) {
+    let pin = match prompt_for_pin(pam_io, used, limit) {
         Ok(pin) => pin,
-        Err(code) => return code as c_int,
+        Err(code) => return code,
     };
 
-    let outcome = match run_pinutil_test(&username, &pin) {
+    let outcome = match run_pinutil_test(username, &pin) {
         Ok(outcome) => outcome,
         Err(err) => {
             error!(
                 "Failed to verify PIN via helper for user {} (uid: {}): {}",
                 username, uid, err
             );
-            if let Err(code) = pam_io.error(&t!("pin_auth_unavail")) {
-                return code as c_int;
-            }
-            return PamReturnCode::AUTHINFO_UNAVAIL as c_int;
+            let _ = pam_io.error(&t!("pin_auth_unavail"));
+            return PamReturnCode::AUTHINFO_UNAVAIL;
         }
     };
 
     match outcome {
         PinutilTestOutcome::Success => {
             info!("PIN authentication successful for user: {}", username);
-            PamReturnCode::SUCCESS as c_int
+            PamReturnCode::SUCCESS
         }
         PinutilTestOutcome::InvalidPin => {
             warn!("PIN authentication failed for user: {}", username);
-            if let Err(code) = pam_io.error(&t!("auth_failure")) {
-                return code as c_int;
-            }
-            PamReturnCode::AUTH_ERR as c_int
+            let _ = pam_io.error(&t!("auth_failure"));
+            PamReturnCode::AUTH_ERR
         }
         PinutilTestOutcome::NewlyLockedOut | PinutilTestOutcome::LockedOut => {
             warn!("User {} (uid: {}) is locked out", username, uid);
-            if let Err(code) = pam_io.error(&t!("account_locked")) {
-                return code as c_int;
-            }
-            PamReturnCode::MAXTRIES as c_int
+            let _ = pam_io.error(&t!("account_locked"));
+            PamReturnCode::MAXTRIES
         }
         PinutilTestOutcome::NotConfigured => {
             info!(
                 "Helper reported no PIN set for user {} (uid: {}) during verification",
                 username, uid
             );
-            if let Err(code) = pam_io.info(&t!("pin_not_conf_for_user")) {
-                return code as c_int;
-            }
-            PamReturnCode::AUTHINFO_UNAVAIL as c_int
+            let _ = pam_io.info(&t!("pin_not_conf_for_user"));
+            PamReturnCode::AUTHINFO_UNAVAIL
         }
         PinutilTestOutcome::Unavailable => {
             error!(
                 "Helper reported TPM unavailable during verification for user {} (uid: {})",
                 username, uid
             );
-            if let Err(code) = pam_io.error(&t!("pin_auth_unavail")) {
-                return code as c_int;
-            }
-            PamReturnCode::AUTHINFO_UNAVAIL as c_int
+            let _ = pam_io.error(&t!("pin_auth_unavail"));
+            PamReturnCode::AUTHINFO_UNAVAIL
         }
     }
 }
 
-/// PAM account management function
+/// PAM account management entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _pamh: *mut pam_sys::PamHandle,
@@ -560,12 +516,13 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _argv: *const *const c_char,
 ) -> c_int {
     init_logging();
-    // For PIN authentication, we typically just return success
-    // Account management is handled by other PAM modules
     pam_sys::PamReturnCode::SUCCESS as c_int
 }
 
-/// PAM session management function
+/// PAM session open entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_open_session(
     _pamh: *mut pam_sys::PamHandle,
@@ -574,11 +531,13 @@ pub unsafe extern "C" fn pam_sm_open_session(
     _argv: *const *const c_char,
 ) -> c_int {
     init_logging();
-    // No special session handling needed for PIN authentication
     pam_sys::PamReturnCode::SUCCESS as c_int
 }
 
-/// PAM session cleanup function
+/// PAM session close entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_close_session(
     _pamh: *mut pam_sys::PamHandle,
@@ -587,11 +546,15 @@ pub unsafe extern "C" fn pam_sm_close_session(
     _argv: *const *const c_char,
 ) -> c_int {
     init_logging();
-    // No special session cleanup needed
     pam_sys::PamReturnCode::SUCCESS as c_int
 }
 
-/// PAM password change function
+/// PAM password change entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
+/// PIN changes are handled out-of-band by `pinutil`, so this module returns
+/// `AUTH_ERR` to indicate it cannot service chauthtok.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_chauthtok(
     _pamh: *mut pam_sys::PamHandle,
@@ -600,12 +563,13 @@ pub unsafe extern "C" fn pam_sm_chauthtok(
     _argv: *const *const c_char,
 ) -> c_int {
     init_logging();
-    // PIN changes are handled by the pinutil utility
-    // This PAM module doesn't support PIN changes directly
     pam_sys::PamReturnCode::AUTH_ERR as c_int
 }
 
-// PAM set credentials function
+/// PAM set-credentials entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_setcred(
     _pamh: *mut pam_sys::PamHandle,
@@ -614,6 +578,5 @@ pub unsafe extern "C" fn pam_sm_setcred(
     _argv: *const *const c_char,
 ) -> c_int {
     init_logging();
-    // No special credential setting needed for PIN authentication
     pam_sys::PamReturnCode::SUCCESS as c_int
 }

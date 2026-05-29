@@ -12,6 +12,7 @@ use tss_esapi::structures::{Auth, MaxNvBuffer, NvPublic};
 use tss_esapi::tcti_ldr::DeviceConfig;
 use tss_esapi::Context;
 
+use crate::pin::Pin;
 use crate::pinconstants::*;
 use crate::pindata::PinData;
 use crate::pinerror::{DeleteResult, TssError, VerificationResult};
@@ -40,10 +41,8 @@ impl PinManager {
     }
 
     /// Provision a new PIN for the supplied user, overwriting anything that might exist.
-    pub fn setup_pin(&mut self, uid: u32, pin: String) -> PinResult<()> {
+    pub fn setup_pin(&mut self, uid: u32, pin: &Pin) -> PinResult<()> {
         debug!("Setting up PIN for user '{}'.", uid);
-
-        self.policy.validate(&pin)?;
 
         let nv_index = nv_index_for_uid(uid)?;
 
@@ -51,7 +50,7 @@ impl PinManager {
             return Err(PinError::AlreadyProvisioned(uid));
         }
 
-        self.define_pin_slot(nv_index, &pin)?;
+        self.define_pin_slot(nv_index, pin.as_bytes())?;
         self.restart_context()?;
         if let Err(err) = self.write_pin_version_tag(uid, PIN_VERSION_CURRENT) {
             warn!(
@@ -82,7 +81,7 @@ impl PinManager {
     /// This allows a user to delete their own PIN by providing the correct PIN.
     /// Returns detailed information about the deletion PinResult.
     /// uses delete_pin_admin internally after verifying the pin
-    pub fn delete_pin_with_auth(&mut self, uid: u32, pin: &str) -> PinResult<DeleteResult> {
+    pub fn delete_pin_with_auth(&mut self, uid: u32, pin: &Pin) -> PinResult<DeleteResult> {
         match self.verify_pin(uid, pin)? {
             VerificationResult::Success(_) => {
                 self.delete_pin_admin(uid)?;
@@ -138,9 +137,8 @@ impl PinManager {
 
     /// Validate a user-supplied PIN against the sealed TPM value.
     /// Returns detailed information about the verification PinResult.
-    pub fn verify_pin(&mut self, uid: u32, pin: &str) -> PinResult<VerificationResult> {
+    pub fn verify_pin(&mut self, uid: u32, pin: &Pin) -> PinResult<VerificationResult> {
         trace!("Verifying PIN for user '{}'.", uid);
-        self.policy.validate(pin)?;
 
         self.clear_sessions();
         match self.read_pin_version_tag(uid)? {
@@ -151,11 +149,11 @@ impl PinManager {
                         version
                     )));
                 }
-                self.verify_pin_exact(uid, pin)
+                self.verify_pin_exact(uid, pin.as_bytes())
             }
             None => {
-                let legacy_pin = normalize_legacy_pin(pin);
-                let pin_result = self.verify_pin_exact(uid, &legacy_pin)?;
+                let legacy_pin = normalize_legacy_pin(pin.as_str());
+                let pin_result = self.verify_pin_exact(uid, legacy_pin.as_bytes())?;
                 if matches!(pin_result, VerificationResult::Success(_)) {
                     self.restart_context()?;
                     if let Err(err) = self.migrate_legacy_pin_format(uid, pin) {
@@ -171,21 +169,21 @@ impl PinManager {
         }
     }
 
-    fn verify_pin_exact(&mut self, uid: u32, pin: &str) -> PinResult<VerificationResult> {
+    fn verify_pin_exact(&mut self, uid: u32, pin_bytes: &[u8]) -> PinResult<VerificationResult> {
         let nv_index = nv_index_for_uid(uid)?;
-        let _new_nv_index_handle = self
+        let nv_index_handle = self
             .context
             .tr_from_tpm_public(nv_index.into())
             .map(NvIndexHandle::from)?;
 
         self.context
             .execute_with_nullauth_session(|ctx| {
-                let auth = Auth::try_from(pin.to_string().as_bytes())?;
-                ctx.tr_set_auth(_new_nv_index_handle.into(), auth)?;
+                let auth = Auth::try_from(pin_bytes)?;
+                ctx.tr_set_auth(nv_index_handle.into(), auth)?;
 
                 ctx.nv_read(
-                    NvAuth::NvIndex(_new_nv_index_handle),
-                    _new_nv_index_handle,
+                    NvAuth::NvIndex(nv_index_handle),
+                    nv_index_handle,
                     PinData::SIZE as u16,
                     0,
                 )
@@ -218,16 +216,16 @@ impl PinManager {
             })
     }
 
-    fn migrate_legacy_pin_format(&mut self, uid: u32, entered_pin: &str) -> PinResult<()> {
-        let legacy_pin = normalize_legacy_pin(entered_pin);
+    fn migrate_legacy_pin_format(&mut self, uid: u32, entered_pin: &Pin) -> PinResult<()> {
+        let legacy_pin = normalize_legacy_pin(entered_pin.as_str());
 
-        if legacy_pin == entered_pin {
+        if legacy_pin == entered_pin.as_str() {
             return self.write_pin_version_tag(uid, PIN_VERSION_CURRENT);
         }
 
         self.delete_pin_admin(uid)?;
         self.restart_context()?;
-        self.setup_pin(uid, entered_pin.to_owned())?;
+        self.setup_pin(uid, entered_pin)?;
         self.restart_context()?;
         Ok(())
     }
@@ -378,10 +376,10 @@ impl PinManager {
         let nv_index = nv_index_for_uid(uid)?;
         self.read_pin_slot_owner(nv_index)
     }
-    fn define_pin_slot(&mut self, nv_index: NvIndexTpmHandle, pin: &str) -> PinResult<()> {
+    fn define_pin_slot(&mut self, nv_index: NvIndexTpmHandle, pin_bytes: &[u8]) -> PinResult<()> {
         // Step 2: Apply policy_nv_written to the trial session
         // This sets up the policy that the NV index must be in the "written" state
-        let auth_value = Auth::try_from(pin.to_string().as_bytes())?;
+        let auth_value = Auth::try_from(pin_bytes)?;
         let (nv_public, _) = self.context.execute_without_session(|ctx| {
             // Step 1: Create a trial policy session to compute the policy digest
             let trial_session = ctx

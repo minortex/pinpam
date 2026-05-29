@@ -7,11 +7,13 @@
 extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
+pub mod master_key;
+pub mod pamlog;
+pub mod pin;
 pub mod pinconstants;
 pub mod pindata;
 pub mod pinerror;
 pub mod pinindex;
 pub mod pinmanager;
 pub mod pinpolicy;
-pub mod master_key;
 pub mod util;

@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use pinpam_core::{
     master_key,
+    pin::Pin,
     pinconstants::MASTER_KEY_SEALED_FILE,
     pindata::AttemptInfo,
     pinerror::{DeleteResult, PinError, PinResult, VerificationResult},
@@ -128,7 +129,7 @@ fn main() -> PinResult<()> {
         }
         Commands::MasterKey(cmd) => {
             if let Err(e) = require_root() {
-                handle_result(Err(e), machine);
+                handle_result::<()>(Err(e), machine);
             }
             match cmd {
                 MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
@@ -295,7 +296,7 @@ where
 }
 
 fn new_manager() -> PinResult<PinManager> {
-    PinManager::new(PinPolicy::load_from_standard_locations())
+    PinManager::new(PinPolicy::cached().clone())
 }
 
 fn setup_pin(username: &str, machine: bool) -> PinResult<()> {
@@ -327,12 +328,12 @@ fn setup_pin(username: &str, machine: bool) -> PinResult<()> {
     // only prompt for confirmation when stdin is an interactive terminal
     if !machine {
         let confirm = prompt_pin(&t!("confirm_pin"), None, machine)?;
-        if pin != confirm {
+        if pin.as_str() != confirm.as_str() {
             return Err(PinError::PinsDontMatch);
         }
     }
 
-    manager.setup_pin(uid, pin)?;
+    manager.setup_pin(uid, &pin)?;
     if !machine {
         println!("{}", t!("pin_set_for_user", "username" => username));
     }
@@ -374,7 +375,7 @@ fn change_pin(username: &str, machine: bool) -> PinResult<()> {
         let new_pin = prompt_pin(&t!("new_pin"), None, machine)?;
         if !machine {
             let confirm = prompt_pin(&t!("confirm"), None, machine)?;
-            if new_pin != confirm {
+            if new_pin.as_str() != confirm.as_str() {
                 return Err(PinError::PinsDontMatch);
             }
         }
@@ -382,7 +383,7 @@ fn change_pin(username: &str, machine: bool) -> PinResult<()> {
         match manager.delete_pin_with_auth(uid, &current)? {
             DeleteResult::Success => {
                 manager.clear_sessions();
-                manager.setup_pin(uid, new_pin)?;
+                manager.setup_pin(uid, &new_pin)?;
                 if !machine {
                     println!("{}", t!("pin_changed_for_user", "username" => username));
                 }
@@ -394,13 +395,13 @@ fn change_pin(username: &str, machine: bool) -> PinResult<()> {
         let new_pin = prompt_pin(&t!("new_pin"), None, machine)?;
         if !machine {
             let confirm = prompt_pin(&t!("confirm"), None, machine)?;
-            if new_pin != confirm {
+            if new_pin.as_str() != confirm.as_str() {
                 return Err(PinError::PinsDontMatch);
             }
         }
         manager.delete_pin_admin(uid)?;
         manager.clear_sessions();
-        manager.setup_pin(uid, new_pin)?;
+        manager.setup_pin(uid, &new_pin)?;
         if !machine {
             println!("{}", t!("pin_changed_for_user", "username" => username));
         }
@@ -552,7 +553,7 @@ fn get_attempt_info(manager: &mut PinManager, uid: u32) -> PinResult<Option<Atte
     Ok(manager.get_pin_slot(uid)?.map(AttemptInfo::from_pin_data))
 }
 
-fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> PinResult<String> {
+fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> PinResult<Pin> {
     use nix::sys::termios::{self, LocalFlags, SetArg};
 
     let stdin = std::io::stdin();
@@ -588,12 +589,7 @@ fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> PinR
         io::stdin().read_line(&mut input)?;
     };
 
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(PinError::PinIsEmpty);
-    }
-
-    Ok(trimmed.to_string())
+    Pin::new(&input, PinPolicy::cached())
 }
 
 fn resolve_username(username: Option<String>) -> PinResult<String> {

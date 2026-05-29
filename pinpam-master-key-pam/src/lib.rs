@@ -7,24 +7,24 @@
 use libc::{c_char, c_int, c_void};
 use log::{error, info, warn};
 use pam_sys::{raw, types::PamItemType, types::PamReturnCode};
-use pinpam_core::{pinerror::PinError, pinpolicy::PinPolicy};
+use pinpam_core::{
+	pamlog::{init_syslog_logger, suppress_tss_logs},
+	pinerror::PinError,
+	pinpolicy::PinPolicy,
+};
 use std::{
-	env,
 	ffi::{CStr, CString},
 	path::Path,
 	process::{Command, Stdio},
 	ptr,
-	sync::OnceLock,
 };
-use syslog::{BasicLogger, Facility, Formatter3164};
 
-fn pin_policy() -> &'static PinPolicy {
-	static POLICY: OnceLock<PinPolicy> = OnceLock::new();
-	POLICY.get_or_init(PinPolicy::load_from_standard_locations)
+fn init_logging() {
+	init_syslog_logger("pinpam-master-key");
 }
 
 fn pinutil_path() -> &'static Path {
-	&pin_policy().pinutil_path
+	&PinPolicy::cached().pinutil_path
 }
 
 fn derive_user_token_via_pinutil(username: &str) -> Result<String, String> {
@@ -61,61 +61,10 @@ fn derive_user_token_via_pinutil(username: &str) -> Result<String, String> {
 	result.map_err(|e| format!("pinutil returned an error: {e}"))
 }
 
-fn init_logging() {
-	static LOGGER_INIT: OnceLock<()> = OnceLock::new();
-	LOGGER_INIT.get_or_init(|| {
-		let rust_log = env::var("RUST_LOG").ok();
-
-		let mut env_builder = env_logger::Builder::new();
-		env_builder.filter_level(log::LevelFilter::Info);
-		if let Some(ref value) = rust_log {
-			env_builder.parse_filters(value);
-		}
-
-		let max_level = rust_log
-			.as_deref()
-			.map(|value| {
-				if value.contains('=') || value.contains(',') {
-					log::LevelFilter::Trace
-				} else {
-					value
-						.parse::<log::LevelFilter>()
-						.unwrap_or(log::LevelFilter::Trace)
-				}
-			})
-			.unwrap_or(log::LevelFilter::Info);
-
-		let formatter = Formatter3164 {
-			facility: Facility::LOG_AUTHPRIV,
-			hostname: None,
-			process: "pinpam-master-key".to_owned(),
-			pid: std::process::id(),
-		};
-
-		if let Ok(writer) = syslog::unix(formatter) {
-			if log::set_boxed_logger(Box::new(BasicLogger::new(writer))).is_ok() {
-				log::set_max_level(max_level);
-				return;
-			}
-		}
-
-		let _ = env_builder.try_init();
-	});
-}
-
-fn suppress_tss_logs() {
-	static SUPPRESS_LOGS: OnceLock<()> = OnceLock::new();
-	SUPPRESS_LOGS.get_or_init(|| {
-		if env::var_os("RUST_LOG").is_none() {
-			unsafe {
-				env::set_var("TSS2_LOG", "all+NONE");
-			}
-		}
-	});
-}
-
-unsafe fn get_pam_user(pamh: *mut pam_sys::PamHandle) -> Result<String, PamReturnCode> {
+fn get_pam_user(pamh: *mut pam_sys::PamHandle) -> Result<String, PamReturnCode> {
 	let mut user_ptr: *const c_char = ptr::null();
+	// SAFETY: PAM contract: `pamh` is valid; `user_ptr` is a local
+	// out-parameter that PAM populates with a pointer it owns.
 	let rc = PamReturnCode::from(unsafe { raw::pam_get_user(pamh, &mut user_ptr, ptr::null()) });
 	if rc != PamReturnCode::SUCCESS {
 		return Err(rc);
@@ -123,21 +72,26 @@ unsafe fn get_pam_user(pamh: *mut pam_sys::PamHandle) -> Result<String, PamRetur
 	if user_ptr.is_null() {
 		return Err(PamReturnCode::USER_UNKNOWN);
 	}
-	let user = unsafe { CStr::from_ptr(user_ptr) }
-		.to_str()
-		.map_err(|_| PamReturnCode::SYSTEM_ERR)?;
-	Ok(user.to_string())
+	// SAFETY: `user_ptr` is non-null and points at a NUL-terminated string
+	// owned by PAM. We copy it into an owned `String` immediately.
+	let cstr = unsafe { CStr::from_ptr(user_ptr) };
+	cstr.to_str()
+		.map(str::to_owned)
+		.map_err(|_| PamReturnCode::SYSTEM_ERR)
 }
 
-unsafe fn set_pam_authtok(
+fn set_pam_authtok(
 	pamh: *mut pam_sys::PamHandle,
 	authtok: &CString,
 ) -> Result<(), PamReturnCode> {
+	// SAFETY: PAM contract: `pamh` is valid; `authtok` is owned by the caller
+	// and outlives this call (CString's NUL-terminated buffer is borrowed
+	// only for the duration of pam_set_item).
 	let rc = PamReturnCode::from(unsafe {
 		raw::pam_set_item(
-		pamh,
-		PamItemType::AUTHTOK as c_int,
-		authtok.as_ptr() as *const c_void,
+			pamh,
+			PamItemType::AUTHTOK as c_int,
+			authtok.as_ptr() as *const c_void,
 		)
 	});
 	if rc != PamReturnCode::SUCCESS {
@@ -146,8 +100,13 @@ unsafe fn set_pam_authtok(
 	Ok(())
 }
 
+/// PAM authentication entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI. `pamh` must be a valid
+/// `pam_handle_t`; `argv` must point to `argc` valid C strings.
 #[unsafe(no_mangle)]
-pub extern "C" fn pam_sm_authenticate(
+pub unsafe extern "C" fn pam_sm_authenticate(
 	pamh: *mut pam_sys::PamHandle,
 	_flags: c_int,
 	_argc: c_int,
@@ -156,7 +115,7 @@ pub extern "C" fn pam_sm_authenticate(
 	init_logging();
 	suppress_tss_logs();
 
-	let user = match unsafe { get_pam_user(pamh) } {
+	let user = match get_pam_user(pamh) {
 		Ok(u) => u,
 		Err(rc) => {
 			warn!("failed to read PAM_USER: {rc:?}");
@@ -164,24 +123,12 @@ pub extern "C" fn pam_sm_authenticate(
 		}
 	};
 
-	// Derive token and replace AUTHTOK. Never log the token.
-	let token = match derive_user_token_via_pinutil(&user) {
-		Ok(t) => t,
-		Err(e) => {
-			error!("failed to derive master-key token for user '{user}': {e}");
-			return PamReturnCode::AUTH_ERR as c_int;
-		}
-	};
-
-	let c_token = match CString::new(token) {
+	let c_token = match build_user_token_cstring(&user) {
 		Ok(s) => s,
-		Err(_) => {
-			error!("derived token contained interior NUL; refusing");
-			return PamReturnCode::AUTH_ERR as c_int;
-		}
+		Err(code) => return code as c_int,
 	};
 
-	if let Err(rc) = unsafe { set_pam_authtok(pamh, &c_token) } {
+	if let Err(rc) = set_pam_authtok(pamh, &c_token) {
 		error!("failed to set PAM_AUTHTOK: {rc:?}");
 		return rc as c_int;
 	}
@@ -190,8 +137,28 @@ pub extern "C" fn pam_sm_authenticate(
 	PamReturnCode::SUCCESS as c_int
 }
 
+/// Pure logic step: derive the token and wrap it in a CString. Returning the
+/// CString separately keeps the unsafe `pam_set_item` call at the entry point.
+fn build_user_token_cstring(user: &str) -> Result<CString, PamReturnCode> {
+	let token = match derive_user_token_via_pinutil(user) {
+		Ok(t) => t,
+		Err(e) => {
+			error!("failed to derive master-key token for user '{user}': {e}");
+			return Err(PamReturnCode::AUTH_ERR);
+		}
+	};
+	CString::new(token).map_err(|_| {
+		error!("derived token contained interior NUL; refusing");
+		PamReturnCode::AUTH_ERR
+	})
+}
+
+/// PAM set-credentials entry point.
+///
+/// # Safety
+/// Called by libpam through a `dlsym` C ABI; see [`pam_sm_authenticate`].
 #[unsafe(no_mangle)]
-pub extern "C" fn pam_sm_setcred(
+pub unsafe extern "C" fn pam_sm_setcred(
 	_pamh: *mut pam_sys::PamHandle,
 	_flags: c_int,
 	_argc: c_int,
@@ -199,4 +166,3 @@ pub extern "C" fn pam_sm_setcred(
 ) -> c_int {
 	PamReturnCode::SUCCESS as c_int
 }
-

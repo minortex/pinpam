@@ -36,11 +36,3 @@ pub fn get_username_from_uid(uid: u32) -> Option<String> {
     use nix::unistd::{Uid, User};
     User::from_uid(Uid::from_raw(uid)).ok()?.map(|u| u.name)
 }
-
-pub fn serialize_error_as_string<T, S>(err: &T, ser: S) -> ::core::result::Result<S::Ok, S::Error>
-where
-    T: std::fmt::Display,
-    S: serde::Serializer,
-{
-    ser.serialize_str(&format!("{err}"))
-}

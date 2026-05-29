@@ -139,7 +139,7 @@ pub fn import_to_tpm(recovery_phrase: &str) -> PinResult<MasterKeyStatus> {
 
     provision_tpm_objects(&hmac_key)?;
     hmac_key.zeroize();
-    Ok(status()?)
+    status()
 }
 
 pub fn clear_from_tpm() -> PinResult<()> {

@@ -1162,6 +1162,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "crc32fast",
+ "env_logger",
  "hex",
  "log",
  "nix 0.30.1",
