@@ -97,6 +97,7 @@ pin_min_length=4
 pin_max_length=6
 pin_lockout_max_attempts=5
 pinutil_path=/nix/store/p2799cpnhk2malpmp7ilqvxg76gajlh9-pinpam-0.1.0/bin/pinutil
+tcti=device:/dev/tpmrm0
 ```
 
 Where
@@ -104,6 +105,19 @@ pin_min_length = minimum length of pin
 pin_max_length = maximum length of pin
 pin_lockout_max_attempts = number of allowed failed attempts before lockout
 pinutil_path = path to pinutil binary to prevent path overwrite attacks. (mandatory)
+tcti = optional TCTI spec naming the TPM backend (defaults to `device:/dev/tpmrm0`). Any string accepted by `tss-esapi`'s `TctiNameConf::from_str` works, e.g. `device:/dev/tpm0`, `tabrmd:bus_name=com.intel.tss2.Tabrmd`, `swtpm:host=127.0.0.1,port=2321`, or `mssim:host=127.0.0.1,port=2321`.
+
+# Running the integration test suite
+
+The `pinpam-core` crate ships an end-to-end test suite that drives the TPM
+through `swtpm`. The suite focuses on backward compatibility: once a PIN has
+been provisioned by any released version, it must remain verifiable. Tests
+gracefully skip when `swtpm` is not on `PATH`.
+
+```
+# from a checkout, with swtpm installed (the devShell provides it)
+cargo test -p pinpam-core --test swtpm_pin
+```
 
 # Building from source
 

@@ -3,6 +3,7 @@ use std::{fs, io::Read, path::Path};
 use crate::{
     pinconstants::*,
     pinerror::{PinError, TssError},
+    tcti::DEFAULT_TCTI_SPEC,
 };
 use log::warn;
 use std::path::PathBuf;
@@ -20,6 +21,9 @@ pub struct PinPolicy {
     pub max_attempts: u32,
     /// Full path to the trusted pinutil binary.
     pub pinutil_path: PathBuf,
+    /// Optional TCTI spec selecting which TPM backend to use. When `None`,
+    /// pinpam talks to the kernel resource manager at `/dev/tpmrm0`.
+    pub tcti: Option<String>,
 }
 
 impl Default for PinPolicy {
@@ -29,6 +33,7 @@ impl Default for PinPolicy {
             max_length: Some(8),
             max_attempts: 3,
             pinutil_path: PathBuf::from(DEFAULT_PINUTIL_PATH),
+            tcti: None,
         }
     }
 }
@@ -57,7 +62,14 @@ impl PinPolicy {
             max_length,
             max_attempts,
             pinutil_path,
+            tcti: None,
         }
+    }
+
+    /// The TCTI spec to use for talking to the TPM, falling back to the kernel
+    /// resource manager device when nothing is configured.
+    pub fn tcti_spec(&self) -> &str {
+        self.tcti.as_deref().unwrap_or(DEFAULT_TCTI_SPEC)
     }
 
     /// Validate an already-normalized PIN string. Callers should use
@@ -110,6 +122,9 @@ impl PinPolicy {
                 "pinutil_path" => {
                     policy.pinutil_path = parse_pinutil_path(value)?;
                 }
+                "tcti" => {
+                    policy.tcti = Some(parse_tcti_setting(value)?);
+                }
                 _ => {}
             }
         }
@@ -147,6 +162,17 @@ impl PinPolicy {
             }
         }
     }
+}
+
+fn parse_tcti_setting(value: &str) -> PinResult<String> {
+    if value.is_empty() {
+        warn!("Ignoring empty tcti policy setting");
+        return Err(invalid_param());
+    }
+    // Reject any spec the loader cannot interpret rather than silently falling
+    // back; this surfaces typos at policy-load time instead of at TPM-open time.
+    crate::tcti::parse_tcti_spec(value)?;
+    Ok(value.to_owned())
 }
 
 fn parse_pinutil_path(value: &str) -> PinResult<PathBuf> {

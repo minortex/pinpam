@@ -531,6 +531,7 @@
                 tpm2-tss.dev
                 openssl.dev
                 tpm2-tools
+                swtpm
                 libclang.lib
 
                 # C/C++ development tools

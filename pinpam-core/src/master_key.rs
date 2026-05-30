@@ -2,6 +2,8 @@ use crate::pinconstants::{
     MASTER_KEY_HMAC_HANDLE, MASTER_KEY_RSA_PARENT_HANDLE, MASTER_KEY_SEALED_FILE,
 };
 use crate::pinerror::{PinError, PinResult};
+use crate::pinpolicy::PinPolicy;
+use crate::tcti::parse_tcti_spec;
 
 use aes_gcm::{
     aead::{consts::U12, Aead, KeyInit},
@@ -11,7 +13,6 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::str::FromStr;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -30,7 +31,6 @@ use tss_esapi::{
     structures::{
         Digest, MaxBuffer, PublicBuilder, PublicKeyedHashParameters, SensitiveData,
     },
-    tcti_ldr::TctiNameConf,
     Context,
 };
 
@@ -194,7 +194,7 @@ fn now_unix_ms() -> u64 {
 }
 
 fn new_context() -> PinResult<Context> {
-    let tcti = TctiNameConf::from_str("device:/dev/tpmrm0")?;
+    let tcti = parse_tcti_spec(PinPolicy::cached().tcti_spec())?;
     Ok(Context::new(tcti)?)
 }
 

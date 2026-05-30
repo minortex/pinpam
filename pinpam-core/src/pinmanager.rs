@@ -1,5 +1,4 @@
 use std::ffi::c_int;
-use std::str::FromStr;
 
 use tss_esapi::abstraction::nv::read_full;
 use tss_esapi::attributes::{NvIndexAttributesBuilder, SessionAttributesBuilder};
@@ -9,7 +8,6 @@ use tss_esapi::interface_types::algorithm::HashingAlgorithm;
 use tss_esapi::interface_types::resource_handles::{NvAuth, Provision};
 use tss_esapi::interface_types::session_handles::PolicySession;
 use tss_esapi::structures::{Auth, MaxNvBuffer, NvPublic};
-use tss_esapi::tcti_ldr::DeviceConfig;
 use tss_esapi::Context;
 
 use crate::pin::Pin;
@@ -17,6 +15,7 @@ use crate::pinconstants::*;
 use crate::pindata::PinData;
 use crate::pinerror::{DeleteResult, TssError, VerificationResult};
 use crate::pinindex::version_nv_index_for_uid;
+use crate::tcti::parse_tcti_spec;
 use crate::util::normalize_legacy_pin;
 use crate::{
     pinerror::{PinError, PinResult},
@@ -27,17 +26,29 @@ use log::{debug, trace, warn};
 pub struct PinManager {
     context: Context,
     policy: pinpolicy::PinPolicy,
+    tcti_spec: String,
 }
 
 impl PinManager {
-    /// Create a new PinManager with the given policy.
+    /// Create a new PinManager using the TCTI configured in the policy
+    /// (defaulting to the kernel resource manager).
     pub fn new(policy: pinpolicy::PinPolicy) -> PinResult<Self> {
-        use std::str::FromStr;
-        use tss_esapi::tcti_ldr::TctiNameConf;
+        let tcti_spec = policy.tcti_spec().to_owned();
+        Self::with_tcti(policy, tcti_spec)
+    }
 
-        let tcti = TctiNameConf::from_str("device:/dev/tpmrm0")?;
+    /// Create a new PinManager pointed at an explicit TCTI spec. Intended for
+    /// tests and tooling that need to drive a simulator independently of the
+    /// installed policy.
+    pub fn with_tcti(policy: pinpolicy::PinPolicy, tcti_spec: impl Into<String>) -> PinResult<Self> {
+        let tcti_spec = tcti_spec.into();
+        let tcti = parse_tcti_spec(&tcti_spec)?;
         let context = Context::new(tcti)?;
-        Ok(Self { context, policy })
+        Ok(Self {
+            context,
+            policy,
+            tcti_spec,
+        })
     }
 
     /// Provision a new PIN for the supplied user, overwriting anything that might exist.
@@ -97,15 +108,7 @@ impl PinManager {
     pub fn delete_pin_admin(&mut self, uid: u32) -> PinResult<()> {
         debug!("Administratively deleting PIN for user '{}'.", uid);
         let nv_index = nv_index_for_uid(uid)?;
-        let session = self.context.start_auth_session(
-            None,
-            None,
-            None,
-            tss_esapi::constants::SessionType::Hmac,
-            tss_esapi::structures::SymmetricDefinition::AES_256_CFB,
-            HashingAlgorithm::Sha256,
-        )?;
-        let result = self.context.execute_with_session(session, |ctx| {
+        let result = self.context.execute_with_nullauth_session(|ctx| {
             let nv_index_handle = ctx
                 .tr_from_tpm_public(nv_index.into())
                 .map(NvIndexHandle::from)?;
@@ -341,10 +344,8 @@ impl PinManager {
         self.context.clear_sessions();
     }
     pub fn restart_context(&mut self) -> PinResult<()> {
-        self.context = Context::new(tss_esapi::tcti_ldr::TctiNameConf::Device(
-            DeviceConfig::from_str("/dev/tpmrm0").map_err(PinError::from)?,
-        ))
-        .map_err(PinError::from)?;
+        let tcti = parse_tcti_spec(&self.tcti_spec)?;
+        self.context = Context::new(tcti).map_err(PinError::from)?;
         Ok(())
     }
     /// Report whether a user is currently locked out.
@@ -375,6 +376,13 @@ impl PinManager {
     pub fn get_pin_slot(&mut self, uid: u32) -> PinResult<Option<PinData>> {
         let nv_index = nv_index_for_uid(uid)?;
         self.read_pin_slot_owner(nv_index)
+    }
+
+    /// Test hook: drop the version tag NV index so verify_pin treats the slot
+    /// as a pre-v0.0.4 PIN and exercises the legacy migration path.
+    #[doc(hidden)]
+    pub fn __test_remove_version_tag(&mut self, uid: u32) -> PinResult<()> {
+        self.delete_pin_version_tag(uid)
     }
     fn define_pin_slot(&mut self, nv_index: NvIndexTpmHandle, pin_bytes: &[u8]) -> PinResult<()> {
         // Step 2: Apply policy_nv_written to the trial session
@@ -498,16 +506,7 @@ impl PinManager {
     }
 
     fn read_pin_slot_owner(&mut self, nv_index: NvIndexTpmHandle) -> PinResult<Option<PinData>> {
-        let session = self.context.start_auth_session(
-            None,
-            None,
-            None,
-            tss_esapi::constants::SessionType::Hmac,
-            tss_esapi::structures::SymmetricDefinition::AES_256_CFB,
-            HashingAlgorithm::Sha256,
-        )?;
-
-        let result = self.context.execute_with_session(session, |ctx| {
+        let result = self.context.execute_with_nullauth_session(|ctx| {
             let data = read_full(ctx, NvAuth::Owner, nv_index)?;
             Ok(PinData::from(data.as_slice()))
         });

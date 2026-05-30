@@ -16,4 +16,5 @@ pub mod pinerror;
 pub mod pinindex;
 pub mod pinmanager;
 pub mod pinpolicy;
+pub mod tcti;
 pub mod util;
