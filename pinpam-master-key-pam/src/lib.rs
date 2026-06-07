@@ -1,8 +1,17 @@
 //! TPM-backed per-user AUTHTOK derivation PAM module.
 //!
-//! This module is intended to run *last* in the pam_authenticate stack.
-//! If authentication succeeded, it replaces PAM_AUTHTOK with:
+//! This module stamps PAM_AUTHTOK with a stable, TPM-bound per-user wallet
+//! token so a downstream keyring module (pam_kwallet, pam_gnome_keyring) can
+//! capture it as the wallet key:
 //!   hex(HMAC(master_key, username))
+//!
+//! It is a *side-effect* module, not an authenticator. It must run after the
+//! real auth decision and before the keyring captures AUTHTOK — the
+//! recommended stacking gates it behind a `requisite` auth substack so it is
+//! only reached on a successful login (see the README). As defence-in-depth
+//! against misconfiguration, `pam_sm_authenticate` never returns
+//! `PAM_SUCCESS`: it returns `PAM_IGNORE` so it can never satisfy the auth
+//! decision on its own, regardless of the control value an admin assigns it.
 
 use libc::{c_char, c_int, c_void};
 use log::{error, info, warn};
@@ -115,26 +124,33 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 	init_logging();
 	suppress_tss_logs();
 
+	// This module is never an authenticator: it returns PAM_IGNORE on every
+	// path so it cannot satisfy the auth decision, and a failure to stamp the
+	// wallet token never blocks an already-successful login. The worst case of
+	// any error below is that the wallet does not auto-unlock.
 	let user = match get_pam_user(pamh) {
 		Ok(u) => u,
 		Err(rc) => {
-			warn!("failed to read PAM_USER: {rc:?}");
-			return rc as c_int;
+			warn!("failed to read PAM_USER: {rc:?}; skipping AUTHTOK stamp");
+			return PamReturnCode::IGNORE as c_int;
 		}
 	};
 
 	let c_token = match build_user_token_cstring(&user) {
 		Ok(s) => s,
-		Err(code) => return code as c_int,
+		Err(rc) => {
+			error!("failed to derive wallet token for '{user}': {rc:?}; skipping AUTHTOK stamp");
+			return PamReturnCode::IGNORE as c_int;
+		}
 	};
 
 	if let Err(rc) = set_pam_authtok(pamh, &c_token) {
-		error!("failed to set PAM_AUTHTOK: {rc:?}");
-		return rc as c_int;
+		error!("failed to set PAM_AUTHTOK for '{user}': {rc:?}");
+		return PamReturnCode::IGNORE as c_int;
 	}
 
-	info!("derived PAM_AUTHTOK for user '{user}'");
-	PamReturnCode::SUCCESS as c_int
+	info!("stamped wallet AUTHTOK for user '{user}'");
+	PamReturnCode::IGNORE as c_int
 }
 
 /// Pure logic step: derive the token and wrap it in a CString. Returning the
@@ -164,5 +180,6 @@ pub unsafe extern "C" fn pam_sm_setcred(
 	_argc: c_int,
 	_argv: *const *const c_char,
 ) -> c_int {
-	PamReturnCode::SUCCESS as c_int
+	// Not a credential manager; stay out of the decision.
+	PamReturnCode::IGNORE as c_int
 }

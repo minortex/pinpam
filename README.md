@@ -264,6 +264,133 @@ Notable toggle options under `security.pinpam`:
 - `enableTpmAccess`: Configures groups and udev rules needed to run pinutil
 - `enableKdePin`: Enables PIN authentication for the kde service (works for kdescreenlocker)
 
+# Master-key: unlocking userspace wallets
+
+pinpam can unlock a userspace secret store (KWallet, GNOME Keyring, `pam_gnupg`,
+…) automatically at login, even when the user logs in with a PIN instead of
+their password. A keyring's PAM module normally captures the login password from
+`PAM_AUTHTOK` and uses it as the wallet key — but a PIN login never provides that
+password, so the wallet stays locked.
+
+The `libpinpam_master_key.so` module bridges this gap. After the auth decision
+has been made, it overwrites `PAM_AUTHTOK` with a stable, TPM-bound per-user
+token:
+
+```
+token = hex(HMAC(tpm_master_key, username))
+```
+
+A downstream keyring module then captures that token as the wallet key. Because
+the token depends only on the username and a TPM-resident master key — not on
+the login method — the wallet is keyed identically whether the user logged in
+with a PIN or a password. (You re-key the wallet to this token once; see your
+keyring's docs for changing the wallet password.)
+
+## How the module behaves
+
+`libpinpam_master_key.so` is a *side-effect* module, not an authenticator. Its
+`pam_sm_authenticate` returns `PAM_IGNORE` on **every** path — success, failure,
+or error — so it can never satisfy (or block) the auth decision regardless of
+the control value an admin gives it. The worst case of any internal error is
+that the wallet simply does not auto-unlock; a login is never granted or denied
+because of this module. This is deliberate defence-in-depth against
+misconfiguration.
+
+Two ordering constraints follow from this:
+
+1. It must run **after** the real auth decision, so the wallet is only unlocked
+   for genuine logins (the keyring opens the session only on overall success).
+2. It must run **before** the keyring module captures `PAM_AUTHTOK`, and after
+   any module (such as nixpkgs' `unix-early`) that would otherwise overwrite the
+   token first.
+
+## The substack pattern
+
+The tricky part is that the common auth methods are `sufficient`: on success
+`pam_unix` (or pinpam) short-circuits the whole stack, skipping the master-key
+and keyring stages entirely. The robust fix is to move the decision into its own
+**substack**. A `sufficient` short-circuit inside a substack is confined to the
+substack — it does not short-circuit the parent — so the parent can still run
+the master-key and keyring stages afterwards.
+
+Hand-written `/etc/pam.d` example (works with `pam_unix` and any `sufficient`
+auth method). Replace the module paths with wherever pinpam is installed on your
+distribution (e.g. `/lib/security` or `/usr/lib/security`). First, the decision
+substack, `/etc/pam.d/pinpam-decide`:
+
+```
+# PIN-or-password decision. Each method is sufficient; its short-circuit stays
+# confined to this substack. The trailing deny fails the substack (and thus the
+# parent) only if every method above failed.
+auth  sufficient  libpinpam.so  try_first_pass
+auth  sufficient  pam_unix.so   try_first_pass likeauth
+auth  requisite   pam_deny.so
+```
+
+Then reference it from the real service, e.g. `/etc/pam.d/sudo`:
+
+```
+auth  substack  pinpam-decide
+auth  optional  libpinpam_master_key.so
+auth  optional  pam_kwallet5.so
+# ... your usual account / password / session lines ...
+```
+
+On success the substack returns success without short-circuiting the parent, so
+master-key stamps the wallet token and `pam_kwallet5` captures it. On failure
+the substack's `requisite pam_deny` fails the substack, and since nothing in the
+parent then succeeds, auth is denied — no terminal `pam_deny` is needed (or
+wanted) in the parent, because a substack cannot short-circuit it on success.
+
+## NixOS configuration
+
+The flake's NixOS module generates exactly this layout for you. Enabling
+`security.pinpam.masterKey` for a service writes a `pinpam-decide-<service>`
+substack, disables the inline success methods and the parent's terminal deny,
+and reorders the keyring rules to run right after the master-key stage:
+
+```nix
+{
+  security.pinpam = {
+    enable = true;
+    auth = {
+      enable = true;
+      services = [ "sudo" "login" ];
+    };
+    masterKey = {
+      enable = true;
+      services.login = {
+        enable = true;
+        # Auth methods whose success should route into the master-key stage.
+        # Each is copied into the decision substack as `sufficient` and disabled
+        # in the parent stack. List exactly the methods you use; add network /
+        # identity methods (e.g. "systemd_home", "ldap", "sss") here too.
+        successRules = [ "pinpam" "unix" ];
+        # Keyring rules moved to run after master-key so they capture the
+        # stamped token. Defaults to the common keyring/secret modules.
+        postAuthRules = [ "kwallet" "gnome_keyring" "gnupg" ];
+      };
+    };
+  };
+}
+```
+
+Relevant options under `security.pinpam.masterKey`:
+
+- `enable`: build and install `libpinpam_master_key.so`.
+- `control`: PAM control for the master-key line itself (default `optional`;
+  the module returns `PAM_IGNORE` regardless).
+- `fallbackDenyOrder`: order used to anchor the injected rules when the service's
+  deny rule order can't be read (default `13700`).
+- `services.<name>.enable`: turn on the master-key flow for a PAM service.
+- `services.<name>.successRules`: see the comment above. Note the module cannot
+  read a rule's original `enable` while disabling it, so a name listed here is
+  always copied into the substack — list only methods you actually use.
+- `services.<name>.postAuthRules`: keyring/secret rules reordered after
+  master-key. Names absent from the service become harmless disabled stubs.
+- `services.<name>.denyAnchorRule`: existing rule used as the ordering anchor
+  (default `"deny"`).
+
 # Arch Linux : AUR Package
 
 This package is also available in the AUR in the package pinpam-git, authored by raze_lighter777 (me).
