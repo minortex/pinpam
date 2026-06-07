@@ -3,12 +3,22 @@
 pinpam is a PAM module and credential utility to enable system-wide authentication with a secure TPM2-backed pin.
 
 # Updates
-
-- v0.0.3 : fix policy access right TOCTOU (credit to nbdd0121), add landlock sandboxing, disallow ./policy as policy source.
+- v0.0.5 :
+  - Experimental support for master-key, seperate optional feature allowing keyring integration and automatic unlocking
+    regardless of auth method! This is a seprate pam module and subproject, and is entirely optional
+  - Large refactoring, reduction in unsafe code surface (it's still needed for TPM methods using unsafe C FFI and PAM using unsafe C FFI)
+  - Fix minor uid overflow bug that could result in errors.
+  - Add AI generated slovak translations to existing human ones. (improvements welcome)
+  - Add automatic sandboxing override for arch linux pkgbuild
+  - swtpm based integration testing.
+  - Fix minor security issue where RUST_LOG would allow enumeration of tpm general details (not key data) by unprivileged user.
+  - Improve comments and update documentation.
+  - Updates to nix flake format.
+  - Note: though the diff is large, most additions were to the test suite and the new pam master-key module.
 - v0.0.4 :
   - skiselkov (6): Add machine readable output/input, and Slovak language support, localization, and various cleanups.
   - RazeLighter777 (3): Fix leading zero pin truncation (with migration for old format), update README.md, remove PTY usage from PAM module, bump versions, add version field to avoid future migration issues.
-
+- v0.0.3 : fix policy access right TOCTOU (credit to nbdd0121), add landlock sandboxing, disallow ./policy as policy source.
 # Features
 
 - Hardware-backed brute force protection

@@ -1,6 +1,6 @@
 # Maintainer: Justin Suess <utilityemal77@gmail.com>
 pkgname=pinpam-git
-pkgver=0.0.4
+pkgver=r50.86a68c3
 pkgrel=1
 pkgdesc="TPM2 backed PAM module and utility for pin-based authentication"
 arch=('x86_64')
@@ -8,9 +8,10 @@ url="https://github.com/RazeLighter777/pinpam"
 license=('GPL-3.0')
 depends=('tpm2-tss' 'pam' 'openssl' 'gcc-libs' 'gcc')
 makedepends=('git' 'rust' 'cargo' 'coreutils' 'gcc')
-provides=("${pkgname}")
+provides=("${pkgname%-git}")
+conflicts=("${pkgname%-git}")
 _git_folder="${pkgname%-git}"
-source=("${_git_folder}::git+${url}.git")
+source=("${_git_folder}::git+${url}.git#branch=master")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -62,7 +63,7 @@ package() {
   install -Dm755 "target/release/pinutil" -t "$pkgdir/usr/bin/"
   install -Dm644 target/release/libpinpam.so -t "$pkgdir/usr/lib/security/"
   install -Dm644 ./policy.conf -t "$pkgdir/etc/pinpam/"
-  install -Dm644 ./polkit-override.conf "$pkgdir/usr/lib/systemd/system/polkit.service.d/override.conf"
+  install -Dm644 ./polkit-override.conf "$pkgdir/usr/lib/systemd/system/polkit.service.d/10-pinpam.conf"
   install -Dm644 LICENSE.txt "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-GPL-3.0"
   # setuid bit for pinutil, so it can access the TPM device
   chmod 4755 "${pkgdir}/usr/bin/pinutil"
