@@ -149,6 +149,7 @@ fn wait_until_ready(port: u16) {
             Ok(_) => return,
             Err(e)
                 if e.kind() == ErrorKind::ConnectionRefused
+                    || e.kind() == ErrorKind::ConnectionReset
                     || e.kind() == ErrorKind::TimedOut => {}
             Err(e) => panic!("unexpected error connecting to swtpm: {e}"),
         }

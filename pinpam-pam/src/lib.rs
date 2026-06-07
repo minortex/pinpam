@@ -198,6 +198,149 @@ fn init_logging() {
     init_syslog_logger("pinpam");
 }
 
+/// Standard PAM module arguments parsed off the module's `argv`.
+///
+/// Only flags that affect this module's behaviour are recorded here; unknown
+/// arguments are ignored to match the `pam_unix(8)` convention.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleArgs {
+    /// Try the previously-stacked module's password before prompting.
+    pub try_first_pass: bool,
+    /// Use the previously-stacked module's password exclusively; never prompt.
+    pub use_first_pass: bool,
+}
+
+impl ModuleArgs {
+    /// Parse module arguments from already-borrowed Rust strings.
+    pub fn from_strs<'a, I>(args: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut out = Self::default();
+        for arg in args {
+            match arg {
+                "try_first_pass" => out.try_first_pass = true,
+                "use_first_pass" => out.use_first_pass = true,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// True if either first-pass mode is requested.
+    pub fn wants_first_pass(self) -> bool {
+        self.try_first_pass || self.use_first_pass
+    }
+}
+
+/// Decision about how to obtain the PIN before verifying it.
+pub enum FirstPassDecision {
+    /// Verify this PIN that came from a previously-stacked module.
+    TryFirstPass(Pin),
+    /// Prompt the user interactively for their PIN.
+    PromptUser,
+    /// Refuse without prompting: `use_first_pass` was set and no usable PIN
+    /// was available on the PAM stack.
+    Deny,
+}
+
+impl FirstPassDecision {
+    /// True iff the decision is to verify a PIN supplied by a stacked module.
+    pub fn is_try_first_pass(&self) -> bool {
+        matches!(self, FirstPassDecision::TryFirstPass(_))
+    }
+
+    /// True iff the decision is to prompt the user interactively.
+    pub fn is_prompt_user(&self) -> bool {
+        matches!(self, FirstPassDecision::PromptUser)
+    }
+
+    /// True iff the decision is to deny without prompting.
+    pub fn is_deny(&self) -> bool {
+        matches!(self, FirstPassDecision::Deny)
+    }
+
+    /// Borrow the embedded PIN, if any. Useful for tests that want to assert
+    /// on the value being forwarded.
+    pub fn pin(&self) -> Option<&Pin> {
+        match self {
+            FirstPassDecision::TryFirstPass(pin) => Some(pin),
+            _ => None,
+        }
+    }
+}
+
+/// Pure decision function: given parsed module args, the authtok that PAM
+/// handed us, and the active PIN policy, decide how to source the PIN.
+///
+/// This is intentionally side-effect-free so it can be exhaustively tested.
+pub fn decide_first_pass(
+    args: ModuleArgs,
+    authtok: Option<&str>,
+    policy: &PinPolicy,
+) -> FirstPassDecision {
+    if !args.wants_first_pass() {
+        return FirstPassDecision::PromptUser;
+    }
+    let candidate = authtok.and_then(|t| Pin::new(t, policy).ok());
+    match (candidate, args.use_first_pass) {
+        (Some(pin), _) => FirstPassDecision::TryFirstPass(pin),
+        (None, true) => FirstPassDecision::Deny,
+        (None, false) => FirstPassDecision::PromptUser,
+    }
+}
+
+/// Convert a raw `argc`/`argv` pair from libpam into owned Rust strings.
+///
+/// Non-UTF-8 arguments are silently skipped — they cannot match either of the
+/// flags we care about anyway.
+///
+/// # Safety
+/// `argv` must point to `argc` valid, NUL-terminated C strings owned by libpam
+/// for the duration of the call. The pointers may be null and are checked.
+unsafe fn argv_to_strings(argc: c_int, argv: *const *const c_char) -> Vec<String> {
+    if argv.is_null() || argc <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(argc as usize);
+    for i in 0..argc as usize {
+        let ptr = unsafe { *argv.add(i) };
+        if ptr.is_null() {
+            continue;
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        if let Ok(s) = cstr.to_str() {
+            out.push(s.to_owned());
+        }
+    }
+    out
+}
+
+/// Read `PAM_AUTHTOK` from the PAM handle, returning `Ok(None)` if no
+/// previously-stacked module has cached one.
+fn get_pam_authtok(pamh: *mut pam_sys::PamHandle) -> PamResult<Option<String>> {
+    let mut item_ptr: *const c_void = ptr::null();
+    // SAFETY: PAM contract: `pamh` is valid for the call; `item_ptr` is a
+    // local out-parameter that PAM populates.
+    let status = PamReturnCode::from(unsafe {
+        raw::pam_get_item(pamh, PamItemType::AUTHTOK as c_int, &mut item_ptr)
+    });
+    if status != PamReturnCode::SUCCESS {
+        return Err(status);
+    }
+    if item_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: PAM returned a non-null pointer to a NUL-terminated string owned
+    // by the PAM stack; copy it into an owned `String` so the borrow does not
+    // outlive this call.
+    let cstr = unsafe { CStr::from_ptr(item_ptr as *const c_char) };
+    match cstr.to_str() {
+        Ok(s) => Ok(Some(s.to_owned())),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Safe wrapper around the PAM conversation function pointer.
 ///
 /// The invariant that `conv` is non-null and points to a live `PamConversation`
@@ -388,12 +531,17 @@ fn prompt_for_pin(io: &PamIo, used: u32, limit: u32) -> PamResult<Pin> {
 pub unsafe extern "C" fn pam_sm_authenticate(
     pamh: *mut pam_sys::PamHandle,
     _flags: c_int,
-    _argc: c_int,
-    _argv: *const *const c_char,
+    argc: c_int,
+    argv: *const *const c_char,
 ) -> c_int {
     init_logging();
     suppress_tss_logs();
     rust_i18n::set_locale(locale_config::Locale::current().as_ref());
+
+    // SAFETY: `argv` must be a valid pointer to `argc` C strings, per the PAM
+    // ABI contract documented on this function.
+    let raw_args = unsafe { argv_to_strings(argc, argv) };
+    let args = ModuleArgs::from_strs(raw_args.iter().map(String::as_str));
 
     let pam_io = match PamIo::new(pamh) {
         Ok(io) => io,
@@ -411,13 +559,33 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         }
     };
 
-    authenticate_user(&pam_io, &username) as c_int
+    let authtok = if args.wants_first_pass() {
+        match get_pam_authtok(pamh) {
+            Ok(value) => value,
+            Err(code) => {
+                error!("Failed to read PAM_AUTHTOK: {:?}", code);
+                return code as c_int;
+            }
+        }
+    } else {
+        None
+    };
+
+    authenticate_user(&pam_io, &username, args, authtok.as_deref()) as c_int
 }
 
 /// Safe implementation of the authentication flow. All FFI has already been
 /// resolved into owned Rust values by the entry point.
-fn authenticate_user(pam_io: &PamIo, username: &str) -> PamReturnCode {
-    debug!("Authenticating user: {}", username);
+fn authenticate_user(
+    pam_io: &PamIo,
+    username: &str,
+    args: ModuleArgs,
+    authtok: Option<&str>,
+) -> PamReturnCode {
+    debug!(
+        "Authenticating user: {} (try_first_pass={}, use_first_pass={})",
+        username, args.try_first_pass, args.use_first_pass
+    );
 
     let uid = match get_uid_from_username(username) {
         Ok(uid) => uid,
@@ -428,7 +596,7 @@ fn authenticate_user(pam_io: &PamIo, username: &str) -> PamReturnCode {
         }
     };
 
-    let (used, limit) = match run_pinutil_status(username) {
+    let (mut used, limit) = match run_pinutil_status(username) {
         PinStatus::Unavailable(err) => {
             error!(
                 "Failed to query PIN status for user {} (uid: {}): {}",
@@ -453,6 +621,71 @@ fn authenticate_user(pam_io: &PamIo, username: &str) -> PamReturnCode {
         PinStatus::Available { used, limit } => (used, limit),
     };
 
+    // Phase 1: try the previously-stacked module's password, if any.
+    let policy = PinPolicy::cached();
+    match decide_first_pass(args, authtok, policy) {
+        FirstPassDecision::Deny => {
+            warn!(
+                "use_first_pass set but no usable PIN available on the PAM stack for user {}",
+                username
+            );
+            let _ = pam_io.error(&t!("auth_failure"));
+            return PamReturnCode::AUTH_ERR;
+        }
+        FirstPassDecision::TryFirstPass(pin) => {
+            let outcome = match run_pinutil_test(username, &pin) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    error!(
+                        "Failed to verify first-pass PIN via helper for user {} (uid: {}): {}",
+                        username, uid, err
+                    );
+                    let _ = pam_io.error(&t!("pin_auth_unavail"));
+                    return PamReturnCode::AUTHINFO_UNAVAIL;
+                }
+            };
+            match outcome {
+                PinutilTestOutcome::Success => {
+                    info!(
+                        "PIN authentication successful for user {} via first-pass",
+                        username
+                    );
+                    return PamReturnCode::SUCCESS;
+                }
+                _ if args.use_first_pass => {
+                    return finalize_outcome(pam_io, outcome, username, uid);
+                }
+                // try_first_pass: fall through to prompting. The attempt we
+                // just made consumed one slot — bump `used` so the prompt
+                // warns appropriately.
+                PinutilTestOutcome::InvalidPin => {
+                    info!(
+                        "First-pass PIN rejected for user {}; prompting interactively",
+                        username
+                    );
+                    used = used.saturating_add(1);
+                }
+                PinutilTestOutcome::NewlyLockedOut | PinutilTestOutcome::LockedOut => {
+                    return finalize_outcome(pam_io, outcome, username, uid);
+                }
+                PinutilTestOutcome::NotConfigured | PinutilTestOutcome::Unavailable => {
+                    return finalize_outcome(pam_io, outcome, username, uid);
+                }
+            }
+        }
+        FirstPassDecision::PromptUser => {}
+    }
+
+    // Refresh after a consumed attempt so we don't over-prompt past the limit.
+    if used >= limit {
+        warn!(
+            "User {} (uid: {}) ran out of attempts after first-pass",
+            username, uid
+        );
+        let _ = pam_io.error(&t!("account_locked"));
+        return PamReturnCode::MAXTRIES;
+    }
+
     let pin = match prompt_for_pin(pam_io, used, limit) {
         Ok(pin) => pin,
         Err(code) => return code,
@@ -470,6 +703,15 @@ fn authenticate_user(pam_io: &PamIo, username: &str) -> PamReturnCode {
         }
     };
 
+    finalize_outcome(pam_io, outcome, username, uid)
+}
+
+fn finalize_outcome(
+    pam_io: &PamIo,
+    outcome: PinutilTestOutcome,
+    username: &str,
+    uid: u32,
+) -> PamReturnCode {
     match outcome {
         PinutilTestOutcome::Success => {
             info!("PIN authentication successful for user: {}", username);
@@ -579,4 +821,135 @@ pub unsafe extern "C" fn pam_sm_setcred(
 ) -> c_int {
     init_logging();
     pam_sys::PamReturnCode::SUCCESS as c_int
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_policy() -> PinPolicy {
+        PinPolicy {
+            min_length: 4,
+            max_length: Some(8),
+            max_attempts: 5,
+            pinutil_path: PathBuf::from("/usr/bin/true"),
+            tcti: None,
+        }
+    }
+
+    #[test]
+    fn module_args_default_to_disabled() {
+        let args = ModuleArgs::from_strs(std::iter::empty());
+        assert!(!args.try_first_pass);
+        assert!(!args.use_first_pass);
+        assert!(!args.wants_first_pass());
+    }
+
+    #[test]
+    fn module_args_parse_known_flags_and_ignore_others() {
+        let args = ModuleArgs::from_strs(
+            ["try_first_pass", "debug", "use_first_pass", "garbage"].into_iter(),
+        );
+        assert!(args.try_first_pass);
+        assert!(args.use_first_pass);
+        assert!(args.wants_first_pass());
+    }
+
+    #[test]
+    fn module_args_unrelated_flags_alone_do_nothing() {
+        let args = ModuleArgs::from_strs(["expose_authtok", "no_warn"].into_iter());
+        assert!(!args.try_first_pass);
+        assert!(!args.use_first_pass);
+    }
+
+    #[test]
+    fn no_first_pass_flag_always_prompts() {
+        let policy = test_policy();
+        let args = ModuleArgs::default();
+        // Even with a perfectly good authtok present, no flag means we prompt.
+        assert!(decide_first_pass(args, Some("1234"), &policy).is_prompt_user());
+        assert!(decide_first_pass(args, None, &policy).is_prompt_user());
+    }
+
+    #[test]
+    fn try_first_pass_uses_valid_pin() {
+        let policy = test_policy();
+        let args = ModuleArgs {
+            try_first_pass: true,
+            use_first_pass: false,
+        };
+        let decision = decide_first_pass(args, Some("4321"), &policy);
+        assert!(decision.is_try_first_pass());
+        assert_eq!(decision.pin().unwrap().as_str(), "4321");
+    }
+
+    #[test]
+    fn try_first_pass_prompts_when_token_is_not_a_pin() {
+        let policy = test_policy();
+        let args = ModuleArgs {
+            try_first_pass: true,
+            use_first_pass: false,
+        };
+        // Letters: not a digit-only PIN; should fall through to prompting
+        // without consuming a TPM attempt.
+        assert!(decide_first_pass(args, Some("hunter2"), &policy).is_prompt_user());
+        // Too short: also not a valid PIN under this policy.
+        assert!(decide_first_pass(args, Some("12"), &policy).is_prompt_user());
+        // Missing authtok entirely.
+        assert!(decide_first_pass(args, None, &policy).is_prompt_user());
+    }
+
+    #[test]
+    fn use_first_pass_denies_when_token_is_not_a_pin() {
+        let policy = test_policy();
+        let args = ModuleArgs {
+            try_first_pass: false,
+            use_first_pass: true,
+        };
+        assert!(decide_first_pass(args, Some("hunter2"), &policy).is_deny());
+        assert!(decide_first_pass(args, Some(""), &policy).is_deny());
+        assert!(decide_first_pass(args, None, &policy).is_deny());
+    }
+
+    #[test]
+    fn use_first_pass_uses_valid_pin() {
+        let policy = test_policy();
+        let args = ModuleArgs {
+            try_first_pass: false,
+            use_first_pass: true,
+        };
+        let decision = decide_first_pass(args, Some("4242"), &policy);
+        assert!(decision.is_try_first_pass());
+        assert_eq!(decision.pin().unwrap().as_str(), "4242");
+    }
+
+    #[test]
+    fn use_first_pass_overrides_try_first_pass_on_bad_token() {
+        let policy = test_policy();
+        // When both flags are set and the token is not usable, the stricter
+        // use_first_pass wins and we deny rather than prompt.
+        let args = ModuleArgs {
+            try_first_pass: true,
+            use_first_pass: true,
+        };
+        assert!(decide_first_pass(args, Some("not-a-pin"), &policy).is_deny());
+    }
+
+    #[test]
+    fn first_pass_respects_policy_bounds() {
+        let policy = PinPolicy {
+            min_length: 6,
+            max_length: Some(6),
+            ..test_policy()
+        };
+        let args = ModuleArgs {
+            try_first_pass: true,
+            use_first_pass: false,
+        };
+        // Wrong length for this policy: token isn't a valid PIN here.
+        assert!(decide_first_pass(args, Some("1234"), &policy).is_prompt_user());
+        // Right length: valid.
+        assert!(decide_first_pass(args, Some("123456"), &policy).is_try_first_pass());
+    }
 }

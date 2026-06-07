@@ -9,7 +9,7 @@ use pinpam_core::{
     pinerror::{DeleteResult, PinError, PinResult, VerificationResult},
     pinmanager::PinManager,
     pinpolicy::PinPolicy,
-    util::{can_manage_pin, get_uid, get_uid_from_username, get_username_from_uid},
+    util::{can_attempt_pin, can_manage_pin, get_uid, get_uid_from_username, get_username_from_uid},
 };
 use std::io::{self, IsTerminal, Write};
 
@@ -99,11 +99,17 @@ fn main() -> PinResult<()> {
         eprintln!("{}: {}", t!("sandbox_fail"), e);
     }
     let cli = Cli::parse();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(if cli.verbose { "debug" } else { "none" }),
-    )
-    .target(env_logger::Target::Stderr)
-    .init();
+    // Don't read RUST_LOG: this binary is setuid/setgid, so an attacker-controlled
+    // environment must not be able to crank up logging. Verbosity is driven solely
+    // by the `-v` flag.
+    env_logger::Builder::new()
+        .filter_level(if cli.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Off
+        })
+        .target(env_logger::Target::Stderr)
+        .init();
     if !cli.verbose {
         unsafe {
             std::env::set_var("TSS2_LOG", "all+NONE");
@@ -471,6 +477,16 @@ fn delete_pin(username: &str, machine: bool) -> PinResult<()> {
 
 fn test_pin(username: &str, machine: bool) -> PinResult<()> {
     let uid = get_uid_from_username(username)?;
+
+    // Each wrong attempt permanently consumes a TPM lockout slot. Restrict
+    // verification to the target user themselves or to a process running with
+    // effective uid 0 (login/sudo/su/polkit drive PAM with euid 0). In the
+    // setgid deployment this still blocks a direct unprivileged
+    // `pinutil test <victim>` loop from locking out every account, while leaving
+    // all PAM paths -- including `su` to another user -- working.
+    if !can_attempt_pin(uid) {
+        return Err(PinError::PermissionDenied);
+    }
 
     let mut manager = new_manager()?;
 

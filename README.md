@@ -107,6 +107,46 @@ pin_lockout_max_attempts = number of allowed failed attempts before lockout
 pinutil_path = path to pinutil binary to prevent path overwrite attacks. (mandatory)
 tcti = optional TCTI spec naming the TPM backend (defaults to `device:/dev/tpmrm0`). Any string accepted by `tss-esapi`'s `TctiNameConf::from_str` works, e.g. `device:/dev/tpm0`, `tabrmd:bus_name=com.intel.tss2.Tabrmd`, `swtpm:host=127.0.0.1,port=2321`, or `mssim:host=127.0.0.1,port=2321`.
 
+# PAM module arguments
+
+`libpinpam.so` accepts the two standard password-stack arguments described in
+`pam.conf(5)` / `pam_unix(8)`:
+
+- `try_first_pass` — Before prompting for a PIN, try the authentication token
+  cached by an earlier module in the stack (e.g. `pam_unix`). The cached token
+  is only fed to the TPM if it actually parses as a valid PIN under the
+  configured policy; non-digit strings or strings outside `pin_min_length` /
+  `pin_max_length` are skipped without consuming a TPM attempt. If the cached
+  token is a valid PIN but the TPM rejects it, the user is then prompted
+  interactively for the remainder of the allowed attempts.
+- `use_first_pass` — Force the module to authenticate exclusively with the
+  cached token from the previous stack entry; never prompt. If no token is
+  cached, or the token is not a valid PIN, or the TPM rejects it, the user is
+  denied. This is the right choice when you want a single combined prompt
+  (e.g. one password field that doubles as a PIN entry behind an earlier
+  module).
+
+Both arguments are off by default. When neither is set, pinpam ignores any
+cached authtok and always prompts for the PIN itself, which is the historical
+behaviour.
+
+Example: configure pinpam to silently piggy-back on the password the user
+already typed for the preceding module, prompting only if that token didn't
+parse as a PIN:
+
+```
+auth  sufficient  libpinpam.so try_first_pass
+```
+
+Example: configure a single-prompt sudo stack where the user types one number
+that both `pam_unix` and pinpam see:
+
+```
+auth  [success=ok default=ignore]  pam_unix.so   nullok
+auth  sufficient                   libpinpam.so  use_first_pass
+auth  required                     pam_deny.so
+```
+
 # Running the integration test suite
 
 The `pinpam-core` crate ships an end-to-end test suite that drives the TPM

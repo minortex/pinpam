@@ -22,6 +22,22 @@ pub fn can_manage_pin(target_uid: u32) -> bool {
     current_uid == 0 || current_uid == target_uid
 }
 
+/// Check if the caller may *attempt* (verify) the target user's PIN. A failed
+/// attempt permanently consumes a TPM lockout slot, so this must be more than a
+/// real-uid check: PAM services such as `su`/`login`/`sudo`/polkit legitimately
+/// verify another user's PIN, and they run with effective uid 0.
+///
+/// Permitted for the target user themselves (real uid == target) or for any
+/// process whose *effective* uid is 0. In the recommended setgid deployment a
+/// direct `pinutil test <other-user>` runs with the caller's own (non-zero)
+/// effective uid, so this blocks the standalone-CLI lockout DoS while leaving
+/// every PAM path working. (Under a setuid deployment euid is always 0, so this
+/// cannot constrain cross-user attempts — a documented reason setgid is
+/// preferred.)
+pub fn can_attempt_pin(target_uid: u32) -> bool {
+    nix::unistd::geteuid().as_raw() == 0 || get_uid() == target_uid
+}
+
 /// Get UID from username using nix crate.
 pub fn get_uid_from_username(username: &str) -> PinResult<u32> {
     use nix::unistd::User;

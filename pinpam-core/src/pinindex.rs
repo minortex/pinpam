@@ -6,9 +6,17 @@ use crate::{
 };
 
 pub fn nv_index_for_uid(uid: u32) -> PinResult<NvIndexTpmHandle> {
-    // add uid to base index, checking for collisions
+    // PIN slots live in [BASE, BASE + PIN_VERSION_NV_INDEX_OFFSET), and the
+    // version tags occupy [BASE + PIN_VERSION_NV_INDEX_OFFSET, ...]. Bounding the
+    // uid to the same range as `version_nv_index_for_uid` keeps the two regions
+    // disjoint; without it a uid >= PIN_VERSION_NV_INDEX_OFFSET would alias a
+    // lower uid's version-tag handle. A plain `checked_add` (no signed cast) also
+    // avoids wrapping into an unrelated handle for uids past i32::MAX.
+    if uid > PIN_VERSION_UID_MAX {
+        return Err(PinError::UidOverflow(uid));
+    }
     let index_value = PIN_NV_INDEX_BASE
-        .checked_add_signed(uid as i32)
+        .checked_add(uid)
         .ok_or(PinError::UidOverflow(uid))?;
     NvIndexTpmHandle::new(index_value).map_err(|e| PinError::TpmError(format!("{e}")))
 }

@@ -247,7 +247,11 @@ fn metadata_is_secure(metadata: &fs::Metadata, path: &Path) -> bool {
     }
 
     let mode = metadata.mode() & 0o777;
-    if (mode & 0o113) != 0 {
+    // Reject anything beyond 0644: group/other write (0o020/0o002) would let a
+    // non-root user rewrite `pinutil_path` and get their binary executed as root
+    // during authentication; execute bits (0o100/0o010/0o001) have no business
+    // on a config file. Owner write (0o200) is the only writable bit allowed.
+    if (mode & 0o133) != 0 {
         warn!(
             "Ignoring PIN policy at {}: expected permissions <=0644 but found {:03o}",
             path.display(),

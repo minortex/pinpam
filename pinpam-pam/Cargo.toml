@@ -7,7 +7,7 @@ license = "MIT"
 
 [lib]
 name = "pinpam"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 log = { workspace = true }

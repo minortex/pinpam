@@ -16,6 +16,17 @@ impl PinData {
         }
     }
     pub const SIZE: usize = std::mem::size_of::<PinData>();
+
+    /// Parse a TPM NV payload into a `PinData`. Returns `None` if the buffer is
+    /// shorter than [`PinData::SIZE`] rather than panicking on a malformed read.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let count = bytes.get(0..4)?;
+        let limit = bytes.get(4..8)?;
+        Some(Self {
+            pinCount: c_int::from_be_bytes(count.try_into().ok()?),
+            pinLimit: c_int::from_be_bytes(limit.try_into().ok()?),
+        })
+    }
 }
 
 impl From<PinData> for Vec<u8> {
@@ -24,17 +35,6 @@ impl From<PinData> for Vec<u8> {
         bytes.extend_from_slice(&value.pinCount.to_be_bytes());
         bytes.extend_from_slice(&value.pinLimit.to_be_bytes());
         bytes
-    }
-}
-
-impl From<&[u8]> for PinData {
-    fn from(bytes: &[u8]) -> Self {
-        let pin_count = c_int::from_be_bytes(bytes[0..4].try_into().unwrap());
-        let pin_limit = c_int::from_be_bytes(bytes[4..8].try_into().unwrap());
-        Self {
-            pinCount: pin_count,
-            pinLimit: pin_limit,
-        }
     }
 }
 

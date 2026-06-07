@@ -191,13 +191,15 @@ impl PinManager {
                     0,
                 )
             })
-            .map(|data| {
-                let slot = PinData::from(data.as_slice());
-                if slot.pinCount >= slot.pinLimit {
+            .and_then(|data| {
+                let slot = PinData::from_bytes(data.as_slice()).ok_or_else(|| {
+                    TssError::WrapperError(tss_esapi::WrapperErrorKind::WrongValueFromTpm)
+                })?;
+                Ok(if slot.pinCount >= slot.pinLimit {
                     VerificationResult::LockedOut
                 } else {
                     VerificationResult::Success(slot)
-                }
+                })
             })
             .or_else(|e| match e {
                 TssError::Tss2Error(rc) => match rc.kind() {
@@ -508,7 +510,9 @@ impl PinManager {
     fn read_pin_slot_owner(&mut self, nv_index: NvIndexTpmHandle) -> PinResult<Option<PinData>> {
         let result = self.context.execute_with_nullauth_session(|ctx| {
             let data = read_full(ctx, NvAuth::Owner, nv_index)?;
-            Ok(PinData::from(data.as_slice()))
+            PinData::from_bytes(data.as_slice()).ok_or_else(|| {
+                TssError::WrapperError(tss_esapi::WrapperErrorKind::WrongValueFromTpm)
+            })
         });
         self.clear_sessions();
 
