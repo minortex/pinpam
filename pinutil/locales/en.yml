@@ -26,3 +26,27 @@ remaining_attempts: "Remaining attempts: %{remaining} out of %{limit}"
 locked_out: "Locked out: %{locked}"
 yes: "Yes"
 no: "No"
+
+# Master key
+requires_interactive_confirmation: "%{purpose} requires interactive confirmation"
+mk_purpose_import: "master-key import"
+mk_purpose_tpm_clear: "master-key TPM clear"
+mk_purpose_disk_clear: "master-key disk clear"
+
+mk_warn_init_new_key: "WARNING: This will initialize a new TPM-backed master key."
+mk_warn_init_break_old_unlocks: "WARNING: Existing automated unlocks depending on the old token will break."
+mk_proceed_prompt: "Proceed? (y/N): "
+
+mk_recovery_phrase_header: "Recovery phrase (displayed once):"
+mk_recovery_confirm_prompt: "Type the recovery phrase back to confirm: "
+mk_recovery_confirm_mismatch: "recovery phrase confirmation mismatch"
+
+mk_recovery_phrase_prompt: "Recovery phrase: "
+mk_import_success: "Imported master key into TPM."
+
+mk_warn_clear_tpm: "WARNING: This removes the persistent master-key handles from the TPM."
+mk_ack_prompt: "Type 'yes' to continue: "
+mk_clear_tpm_success: "Cleared master key handles from TPM."
+
+mk_warn_clear_disk: "WARNING: This deletes %{path}."
+mk_clear_disk_success: "Deleted sealed master-key recovery file."

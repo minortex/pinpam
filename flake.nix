@@ -19,6 +19,72 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
+
+      mkPinpamPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "pinpam";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            clang
+            llvm
+          ];
+
+          buildInputs = with pkgs; [
+            linux-pam
+            tpm2-tss.dev
+            openssl
+            libclang.lib
+          ];
+
+          # Set environment variables for building
+          OPENSSL_NO_VENDOR = 1;
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.linux-pam}/lib/pkgconfig:${pkgs.tpm2-tss.dev}/lib/pkgconfig";
+
+          buildPhase = ''
+            runHook preBuild
+
+            # Build the workspace
+            cargo build --release --workspace
+
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+
+            # Install PAM module (shared library from pinpam-pam crate)
+            mkdir -p $out/lib/security
+            cp target/release/libpinpam.so $out/lib/security/
+            cp target/release/libpinpam_master_key.so $out/lib/security/
+
+            # Install pinutil binary
+            mkdir -p $out/bin
+            cp target/release/pinutil $out/bin/
+
+            runHook postInstall
+          '';
+          phases = [
+            "unpackPhase"
+            "buildPhase"
+            "installPhase"
+          ];
+
+          meta = with pkgs.lib; {
+            description = "TPM-backed PIN authentication PAM module";
+            license = licenses.mit;
+            platforms = platforms.linux;
+            maintainers = [ ];
+          };
+        };
       forEachSupportedSystem =
         f:
         nixpkgs.lib.genAttrs supportedSystems (
@@ -35,68 +101,7 @@
       packages = forEachSupportedSystem (
         { pkgs }:
         {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "pinpam";
-            version = "0.1.0";
-
-            src = ./.;
-
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              clang
-              llvm
-            ];
-
-            buildInputs = with pkgs; [
-              linux-pam
-              tpm2-tss.dev
-              openssl
-              libclang.lib
-            ];
-
-            # Set environment variables for building
-            OPENSSL_NO_VENDOR = 1;
-            PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.linux-pam}/lib/pkgconfig:${pkgs.tpm2-tss.dev}/lib/pkgconfig";
-
-            buildPhase = ''
-              runHook preBuild
-
-              # Build the workspace
-              cargo build --release --workspace
-
-              runHook postBuild
-            '';
-
-            installPhase = ''
-              runHook preInstall
-
-              # Install PAM module (shared library from pinpam-pam crate)
-              mkdir -p $out/lib/security
-              cp target/release/libpinpam.so $out/lib/security/
-
-              # Install pinutil binary
-              mkdir -p $out/bin
-              cp target/release/pinutil $out/bin/
-
-              runHook postInstall
-            '';
-            phases = [
-              "unpackPhase"
-              "buildPhase"
-              "installPhase"
-            ];
-
-            meta = with pkgs.lib; {
-              description = "TPM-backed PIN authentication PAM module";
-              license = licenses.mit;
-              platforms = platforms.linux;
-              maintainers = [ ];
-            };
-          };
+          default = mkPinpamPackage pkgs;
         }
       );
 
@@ -109,287 +114,429 @@
         }:
         let
           cfg = config.security.pinpam;
+
+          mkPinpamAuthRule = _service:
+            {
+              rules.auth.pinpam = {
+                control = cfg.auth.control;
+                modulePath = "${cfg.package}/lib/security/libpinpam.so";
+                order = cfg.auth.fallbackOrder;
+              };
+            };
+
+          # Name of the generated auth-decision substack for a service.
+          masterKeySubstackName = service: "pinpam-decide-${service}";
+
+          # Auth rules already configured for a service by other NixOS modules.
+          # Only ever read for VALUES (modulePath/args/order) inside lazily
+          # evaluated fields; never used to decide which keys this module
+          # contributes to `rules.auth`, since reading the keyset of an attrset
+          # we also write to is an infinite recursion.
+          authRulesFor = service:
+            lib.attrByPath [ service "rules" "auth" ] { } config.security.pam.services;
+
+          # Curated success-method names actually present in the service, sorted
+          # in their existing stack order so PIN is tried before the password.
+          # `rules ? name` here is safe: it runs while evaluating the substack
+          # file text, after the (statically keyed) rule set is computable.
+          presentSuccessRules = service: serviceCfg:
+            let
+              rules = authRulesFor service;
+              present = lib.filter (name: rules ? ${name}) (lib.unique serviceCfg.successRules);
+            in
+            lib.sort (a: b: rules.${a}.order < rules.${b}.order) present;
+
+          # Escape a module argument the same way nixpkgs' pam renderer does.
+          formatPamArg = token:
+            if lib.hasInfix " " token then
+              "[${lib.replaceStrings [ "]" ] [ "\\]" ] token}]"
+            else
+              token;
+
+          # Render the decision substack file. Each curated success method
+          # becomes a `sufficient` line: its short-circuit ("done") is confined
+          # to the substack, so the parent stack still runs the master-key +
+          # keyring stages afterwards. A terminal `requisite pam_deny` makes the
+          # substack fail iff no method authenticated.
+          mkMasterKeySubstackText = service: serviceCfg:
+            let
+              rules = authRulesFor service;
+              lines = map (
+                name:
+                let r = rules.${name}; in
+                lib.concatStringsSep " " (
+                  [ "auth" "sufficient" r.modulePath ] ++ map formatPamArg r.args
+                )
+              ) (presentSuccessRules service serviceCfg);
+            in
+            ''
+              # Generated by pinpam. PIN-or-fallback auth decision for "${service}".
+              # Each method is `sufficient`; its short-circuit stays confined to
+              # this substack so the parent stack runs the master-key + keyring
+              # stages on success. The trailing deny fails the substack (and thus
+              # the parent) only when every method above failed.
+              ${lib.concatStringsSep "\n" lines}
+              auth requisite pam_deny.so
+            '';
+
+          mkMasterKeyService = service: serviceCfg:
+            let
+              # Anchor everything to the service's terminal deny rule (always
+              # present). Read of `.order` is a value read and does not depend on
+              # this module's key contributions, so it cannot recurse.
+              denyAnchorOrder =
+                lib.attrByPath [ serviceCfg.denyAnchorRule "order" ]
+                  cfg.masterKey.fallbackDenyOrder
+                  (authRulesFor service);
+              decideOrder = denyAnchorOrder - 40;
+              masterKeyOrder = denyAnchorOrder - 30;
+
+              # All override keysets below are STATIC (derived from the option
+              # lists, not from the live rule set), so the merged `rules.auth`
+              # key set stays computable without forcing these values.
+
+              # The curated success methods now live in the substack; disable the
+              # inline copies so they are not also evaluated in the parent. A name
+              # that does not exist becomes a harmless disabled stub (filtered out
+              # before its required fields are read).
+              disableSuccessOverrides =
+                lib.genAttrs (lib.unique serviceCfg.successRules)
+                  (_: { enable = lib.mkForce false; });
+
+              # A substack cannot short-circuit its parent, so the parent's
+              # terminal `required pam_deny` would fail even a successful login.
+              # The substack's own deny is the all-failed backstop instead.
+              disableDenyOverride = {
+                ${serviceCfg.denyAnchorRule}.enable = lib.mkForce false;
+              };
+
+              # Move keyring rules to run right after the master-key stage so they
+              # capture the freshly-stamped AUTHTOK. Keys are static, so a name
+              # that is absent from the service still gets a definition here. The
+              # `mkDefault` filler turns such an absent name into a disabled stub
+              # (filtered out before rendering); a real keyring rule sets these
+              # fields at normal priority and wins, keeping its module path while
+              # adopting the forced order.
+              postRuleOrderOverrides =
+                lib.listToAttrs (
+                  lib.imap0 (
+                    index: name:
+                    lib.nameValuePair name {
+                      order = lib.mkForce (masterKeyOrder + 1 + index);
+                      enable = lib.mkOverride 1490 false;
+                      control = lib.mkDefault "optional";
+                      modulePath = lib.mkDefault "pam_deny.so";
+                    }
+                  ) (lib.unique serviceCfg.postAuthRules)
+                );
+
+              composedOverrides =
+                lib.foldl' lib.recursiveUpdate { } [
+                  disableSuccessOverrides
+                  disableDenyOverride
+                  postRuleOrderOverrides
+                ];
+            in
+            {
+              rules.auth = composedOverrides // {
+                # The decision substack. On failure its internal deny fails the
+                # substack; the parent then ends without a success, denying auth.
+                pinpamMasterKeyDecide = {
+                  control = "substack";
+                  modulePath = masterKeySubstackName service;
+                  order = decideOrder;
+                };
+
+                # Stamp AUTHTOK with the per-user wallet token. Side-effect only:
+                # the module returns PAM_IGNORE and never affects the decision.
+                pinpamMasterKey = {
+                  control = cfg.masterKey.control;
+                  modulePath = "${cfg.package}/lib/security/libpinpam_master_key.so";
+                  order = masterKeyOrder;
+                };
+              };
+            };
+
+          enabledAuthServices = lib.unique cfg.auth.services;
+          enabledMasterKeyServices = lib.filterAttrs (_: serviceCfg: serviceCfg.enable) cfg.masterKey.services;
+
+          moduleEnabled = cfg.enable || cfg.auth.enable || cfg.masterKey.enable;
         in
         {
           options.security.pinpam = {
-            enable = lib.mkEnableOption "TPM-backed PIN authentication PAM module";
+            enable = lib.mkEnableOption "pinpam integration base settings";
 
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
+              default = mkPinpamPackage pkgs;
               description = "The pinpam package to use";
             };
 
-            enableTpmAccess = lib.mkOption {
-              type = lib.types.bool;
-              default = true;
-              description = ''
-                Add udev rules to allow the tss group read/write access to TPM devices.
-                This is required for non-root users to use the TPM for PIN operations.
-              '';
-            };
-
-            enableSudoPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for sudo.
-                This adds the pinpam module to sudo's PAM configuration with priority 10 lower
-                than standard unix authentication (order = config.security.pam.services.sudo.rules.auth.unix.order + 10).
-                Users can authenticate with either their standard password or TPM PIN.
-              '';
-            };
-            enablLoginPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-            };
-
-            enableSystemAuthPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for the system-auth PAM service.
-                This adds the pinpam module as a sufficient authentication method so users can
-                log in with either their regular password or TPM PIN depending on the service
-                stack consuming system-auth.
-              '';
-            };
-
-            enableLoginPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for the login PAM service.
-                This adds the pinpam module as a sufficient authentication method so login
-                users can authenticate with either their standard password or TPM PIN.
-              '';
-            };
-            enableKdePin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for the kde service.
-                This adds the pinpam module as a sufficient authentication method so login
-                users can authenticate with either their standard password or TPM PIN.
-              '';
-            };
-            enableHyprlockPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for the hyprlock PAM service.
-                Users can authenticate with either their standard password or TPM PIN.
-              '';
-            };
-
-            enablePolkitPin = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Enable TPM PIN authentication for polkit-1.
-                This also adjusts the polkit-agent-helper@.service to allow TPM device access.
-                Users can authenticate with either their standard password or TPM PIN.
-              '';
-            };
-
-            pinutilPath = lib.mkOption {
-              type = lib.types.str;
-              default = "${toString config.security.wrapperDir}/pinutil";
-              description = ''
-                Absolute path to the trusted pinutil binary. This value is embedded into the
-                generated PIN policy to ensure pinpam only invokes the expected executable.
-              '';
-            };
-
-            pinPolicy = {
-              minLength = lib.mkOption {
-                type = lib.types.ints.unsigned;
-                default = 4;
-                description = ''
-                  Minimum PIN length enforced by the TPM policy.
-                  Values below 4 are strongly discouraged because they significantly weaken the brute-force resistance of the PIN.
-                '';
+            tpm = {
+              enableAccess = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = "Configure TPM device access for the pinpam runtime group.";
               };
 
-              maxLength = lib.mkOption {
-                type = lib.types.nullOr lib.types.ints.unsigned;
-                default = 8;
-                description = ''
-                  Maximum PIN length enforced by the TPM policy.
-                  Set to null to disable the upper bound.
-                '';
-              };
-
-              maxAttempts = lib.mkOption {
-                type = lib.types.ints.unsigned;
-                default = 5;
-                description = ''
-                  Maximum number of failed PIN attempts before user lockout.
-                  Set to 0 to disable lockout entirely.
-                  This configures per-user PIN counters using TPM_NT_PIN_FAIL hardware-backed protection.
-                '';
+              group = lib.mkOption {
+                type = lib.types.str;
+                default = "tss";
+                description = "Group granted access to TPM character devices.";
               };
             };
 
-            policyFile = lib.mkOption {
-              type = lib.types.nullOr lib.types.path;
-              default = null;
-              description = ''
-                Path to a custom PIN counter policy configuration file.
-                If set, this file will be used instead of the auto-generated one from pinPolicy options.
-                The file must contain whitespace-separated key/value pairs understood by pinpam, such as:
-                pin_min_length=4 pin_max_length=8 pin_lockout_max_attempts=5
-              '';
+            pin = {
+              pinutilPath = lib.mkOption {
+                type = lib.types.str;
+                default = "/run/wrappers/bin/pinutil";
+                defaultText = lib.literalExpression ''"\${config.security.wrapperDir}/pinutil"'';
+                description = ''
+                  Absolute path to trusted pinutil used in generated PIN policy.
+                '';
+              };
+
+              policyFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Optional path to a custom pinpam policy file.";
+              };
+
+              policy = {
+                minLength = lib.mkOption {
+                  type = lib.types.ints.unsigned;
+                  default = 4;
+                  description = "Minimum PIN length.";
+                };
+
+                maxLength = lib.mkOption {
+                  type = lib.types.nullOr lib.types.ints.unsigned;
+                  default = 8;
+                  description = "Maximum PIN length (null disables upper bound).";
+                };
+
+                maxAttempts = lib.mkOption {
+                  type = lib.types.ints.unsigned;
+                  default = 5;
+                  description = "Maximum failed PIN attempts before lockout.";
+                };
+              };
+            };
+
+            auth = {
+              enable = lib.mkEnableOption "pinpam PIN authentication PAM module";
+
+              services = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = ''
+                  PAM services to receive the pinpam auth module.
+                  Examples: [ "sudo" "login" "hyprlock" "polkit-1" "kde" "system-auth" ].
+                '';
+              };
+
+              control = lib.mkOption {
+                type = lib.types.str;
+                default = "sufficient";
+                description = "PAM control value used for the pinpam auth module.";
+              };
+
+              fallbackOrder = lib.mkOption {
+                type = lib.types.int;
+                default = 11050;
+                description = "Fallback auth rule order when no unix anchor rule exists.";
+              };
+
+              preferOrderBeforeUnix = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = "Place pinpam before unix when the unix rule exists.";
+              };
+
+              orderOffsetFromUnix = lib.mkOption {
+                type = lib.types.int;
+                default = 50;
+                description = "Offset subtracted from unix order when preferOrderBeforeUnix is true.";
+              };
+            };
+
+            masterKey = {
+              enable = lib.mkEnableOption "pinpam master-key AUTHTOK PAM module";
+
+              control = lib.mkOption {
+                type = lib.types.str;
+                default = "optional";
+                description = "PAM control value for the master-key module itself.";
+              };
+
+              fallbackDenyOrder = lib.mkOption {
+                type = lib.types.int;
+                default = 13700;
+                description = "Fallback deny anchor order when the service deny rule is absent.";
+              };
+
+              services = lib.mkOption {
+                type = lib.types.attrsOf (
+                  lib.types.submodule {
+                    options = {
+                      enable = lib.mkEnableOption "master-key flow for this service";
+
+                      denyAnchorRule = lib.mkOption {
+                        type = lib.types.str;
+                        default = "deny";
+                        description = "Existing rule used as the ordering anchor for injected master-key rules.";
+                      };
+
+                      successRules = lib.mkOption {
+                        type = lib.types.listOf lib.types.str;
+                        default = [
+                          "pinpam"
+                          "unix"
+                        ];
+                        description = ''
+                          Auth rule names whose success should route into the master-key
+                          stage. Each listed rule is copied into the generated decision
+                          substack as a `sufficient` method and disabled in the parent
+                          stack, so its short-circuit no longer skips the master-key and
+                          keyring stages.
+
+                          List exactly the `sufficient` methods you actually use. Add your
+                          network/identity methods here too (e.g. `systemd_home`, `ldap`,
+                          `kanidm`, `sss`). Note: these rules always exist in the NixOS
+                          rule set even when their feature is disabled, and the module
+                          cannot read a rule's original `enable` while overriding it, so a
+                          name listed here is always copied into the substack regardless of
+                          whether its backing feature is on.
+                        '';
+                      };
+
+                      postAuthRules = lib.mkOption {
+                        type = lib.types.listOf lib.types.str;
+                        default = [
+                          "kwallet"
+                          "gnupg"
+                          "gnome_keyring"
+                          "intune"
+                          "mount"
+                          "zfs_key"
+                          "fscrypt"
+                        ];
+                        description = ''
+                          Existing auth rules moved to execute after master-key so they can
+                          consume updated AUTHTOK.
+                        '';
+                      };
+                    };
+                  }
+                );
+                default = { };
+                description = ''
+                  Per-service master-key configuration.
+                  Keys are PAM service names (e.g. hyprlock, sudo, polkit-1).
+                '';
+              };
+            };
+
+            polkit = {
+              enableAgentTpmAccess = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = ''
+                  Allow TPM access inside polkit-agent-helper sandbox when polkit-1 is targeted.
+                '';
+              };
+            };
+
+            pinutil = {
+              enableWrapper = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = "Install setgid pinutil wrapper for TPM group access.";
+              };
             };
           };
 
-          config = lib.mkIf cfg.enable (
+          config = lib.mkIf moduleEnabled (
             lib.mkMerge [
               {
-                # Add the PAM module to the system
                 environment.systemPackages = [ cfg.package ];
+              }
 
-                # Set up security wrapper for pinutil with setgid
+              (lib.mkIf cfg.pinutil.enableWrapper {
                 security.wrappers.pinutil = {
                   setgid = true;
                   owner = "root";
-                  group = "tss";
+                  group = cfg.tpm.group;
                   source = "${cfg.package}/bin/pinutil";
                 };
+              })
 
-                # Ensure tss group exists
-                users.groups.tss = { };
+              (lib.mkIf cfg.tpm.enableAccess {
+                users.groups.${cfg.tpm.group} = { };
+                services.udev.enable = true;
+                services.udev.extraRules = ''
+                  KERNEL=="tpm[0-9]*", TAG+="systemd", MODE="0660", GROUP="${cfg.tpm.group}"
+                  KERNEL=="tpmrm[0-9]*", TAG+="systemd", MODE="0660", GROUP="${cfg.tpm.group}"
+                '';
+              })
 
-                # Install policy file
+              (lib.mkIf cfg.auth.enable {
+                security.pam.services = lib.listToAttrs (
+                  map (
+                    service:
+                    lib.nameValuePair service (mkPinpamAuthRule service)
+                  ) enabledAuthServices
+                );
+
                 environment.etc."pinpam/policy" =
-                  if cfg.policyFile != null then
+                  if cfg.pin.policyFile != null then
                     {
-                      # Use custom policy file
-                      source = cfg.policyFile;
+                      source = cfg.pin.policyFile;
                       mode = "0644";
                       user = "root";
                       group = "root";
                     }
                   else
                     {
-                      # Generate policy file from pinPolicy options
                       text =
                         let
-                          policyLines = [
-                            "pin_min_length=${toString cfg.pinPolicy.minLength}"
+                          lines = [
+                            "pin_min_length=${toString cfg.pin.policy.minLength}"
                           ]
-                          ++ lib.optional (
-                            cfg.pinPolicy.maxLength != null
-                          ) "pin_max_length=${toString cfg.pinPolicy.maxLength}"
+                          ++ lib.optional (cfg.pin.policy.maxLength != null)
+                            "pin_max_length=${toString cfg.pin.policy.maxLength}"
                           ++ [
-                            "pin_lockout_max_attempts=${toString cfg.pinPolicy.maxAttempts}"
-                            "pinutil_path=${toString cfg.pinutilPath}"
+                            "pin_lockout_max_attempts=${toString cfg.pin.policy.maxAttempts}"
+                            "pinutil_path=${cfg.pin.pinutilPath}"
                           ];
                         in
-                        lib.concatStringsSep "\n" (policyLines ++ [ "" ]);
+                        lib.concatStringsSep "\n" (lines ++ [ "" ]);
                       mode = "0644";
                       user = "root";
                       group = "root";
                     };
-              }
-
-              # TPM access configuration
-              (lib.mkIf cfg.enableTpmAccess {
-                # Enable udev service
-                services.udev.enable = true;
-
-                # Add udev rules for TPM access by tss group
-                services.udev.extraRules = ''
-                  # TPM device access for tss group
-                  KERNEL=="tpm[0-9]*", TAG+="systemd", MODE="0660", GROUP="tss"
-                  KERNEL=="tpmrm[0-9]*", TAG+="systemd", MODE="0660", GROUP="tss"
-                '';
               })
 
-              # Sudo PAM configuration
-              (lib.mkIf cfg.enableSudoPin {
-                security.pam.services.sudo.rules.auth.pinpam = {
-                  control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.sudo.rules.auth.unix.order - 10;
-                };
+              (lib.mkIf cfg.masterKey.enable {
+                security.pam.services = lib.mapAttrs mkMasterKeyService enabledMasterKeyServices;
+
+                # Write each generated auth-decision substack to /etc/pam.d so the
+                # `auth substack pinpam-decide-<service>` references resolve.
+                environment.etc = lib.mapAttrs' (
+                  service: serviceCfg:
+                  lib.nameValuePair "pam.d/${masterKeySubstackName service}" {
+                    text = mkMasterKeySubstackText service serviceCfg;
+                  }
+                ) enabledMasterKeyServices;
               })
 
-              # Login PAM configuration
-              (lib.mkIf cfg.enableLoginPin {
-                security.pam.services.login.rules.auth.pinpam = {
-                  control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.login.rules.auth.unix.order - 10;
-                };
-              })
-              # KDE PAM configuration
-              (lib.mkIf cfg.enableKdePin {
-                security.pam.services.kde.rules.auth.pinpam = {
-                  control = "sufficient";
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                  order = config.security.pam.services.kde.rules.auth.unix.order - 10;
-                };
-              })
-              (lib.mkIf cfg.enableSystemAuthPin {
-                security.pam.services."system-auth".rules.auth.pinpam =
-                  let
-                    unixOrder = lib.attrByPath [
-                      "security"
-                      "pam"
-                      "services"
-                      "system-auth"
-                      "rules"
-                      "auth"
-                      "unix"
-                      "order"
-                    ] null config;
-                  in
-                  {
-                    control = "sufficient";
-                    modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                    order = if unixOrder != null then unixOrder - 10 else 110;
-                  };
-              })
-
-              (lib.mkIf cfg.enableLoginPin {
-                security.pam.services.login.rules.auth.pinpam =
-                  let
-                    unixOrder = lib.attrByPath [
-                      "security"
-                      "pam"
-                      "services"
-                      "login"
-                      "rules"
-                      "auth"
-                      "unix"
-                      "order"
-                    ] null config;
-                  in
-                  {
-                    control = "sufficient";
-                    modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                    order = if unixOrder != null then unixOrder - 10 else 110;
-                  };
-              })
-
-              (lib.mkIf cfg.enableHyprlockPin {
-                security.pam.services.hyprlock.rules.auth.pinpam = {
-                  control = "sufficient";
-                  order = config.security.pam.services.hyprlock.rules.auth.unix.order - 10;
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                };
-              })
-
-              (lib.mkIf cfg.enablePolkitPin {
-                security.pam.services.polkit-1.rules.auth.pinpam = {
-                  control = "sufficient";
-                  order = config.security.pam.services.polkit-1.rules.auth.unix.order - 10;
-                  modulePath = "${cfg.package}/lib/security/libpinpam.so";
-                };
-              })
-
-              (lib.mkIf cfg.enablePolkitPin {
+              (lib.mkIf (
+                cfg.polkit.enableAgentTpmAccess
+                && (
+                  (cfg.auth.enable && lib.elem "polkit-1" enabledAuthServices)
+                  || lib.hasAttr "polkit-1" enabledMasterKeyServices
+                )
+              ) {
                 systemd.services."polkit-agent-helper@".serviceConfig = {
                   PrivateDevices = "no";
                   DeviceAllow = [
@@ -418,8 +565,6 @@
               [
                 # Rust development tools
                 rust-analyzer
-                rustfmt
-                clippy
                 cargo-audit
                 cargo-deny
                 cargo-watch
@@ -429,6 +574,7 @@
                 tpm2-tss.dev
                 openssl.dev
                 tpm2-tools
+                swtpm
                 libclang.lib
 
                 # C/C++ development tools

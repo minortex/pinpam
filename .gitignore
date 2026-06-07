@@ -2,3 +2,17 @@
 pkg/
 ./src/
 pinpam
+.direnv/
+
+# CMake / C build output
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/libpinpam.so
+/setup_pin
+.cache/
+
+# stray editor/tooling tempfiles
+*.tmp.*

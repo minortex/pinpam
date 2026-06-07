@@ -2,8 +2,14 @@
 
 use clap::{Parser, Subcommand};
 use pinpam_core::{
-    can_manage_pin, get_uid, get_uid_from_username, get_username_from_uid, AttemptInfo,
-    DeleteResult, PinError, PinManager, PinPolicy, VerificationResult,
+    master_key,
+    pin::Pin,
+    pinconstants::MASTER_KEY_SEALED_FILE,
+    pindata::AttemptInfo,
+    pinerror::{DeleteResult, PinError, PinResult, VerificationResult},
+    pinmanager::PinManager,
+    pinpolicy::PinPolicy,
+    util::{can_attempt_pin, can_manage_pin, get_uid, get_uid_from_username, get_username_from_uid},
 };
 use std::io::{self, IsTerminal, Write};
 
@@ -13,13 +19,11 @@ i18n!("locales", fallback = "en");
 
 mod sandbox;
 
-type Result<T> = ::core::result::Result<T, pinpam_core::PinError>;
-
 #[derive(Parser)]
 #[command(
     name = "pinutil",
     about = "TPM PIN authentication utility",
-    version = "0.1.0"
+    version = "0.0.5"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -64,19 +68,48 @@ enum Commands {
         #[arg(value_name = "USERNAME")]
         username: Option<String>,
     },
+
+    /// Manage the TPM-backed master AUTHTOK key
+    #[command(subcommand)]
+    MasterKey(MasterKeyCommands),
 }
 
-fn main() -> Result<()> {
+#[derive(Subcommand)]
+enum MasterKeyCommands {
+    /// Initialize a new TPM-backed master key and write recovery data to disk
+    Init,
+    /// Show master-key provisioning status
+    Status,
+    /// Import the master key into TPM using the recovery phrase
+    ImportToTpm,
+    /// Remove master-key persistent handles from TPM
+    ClearFromTpm,
+    /// Delete the sealed recovery blob from disk
+    ClearFromDisk,
+    /// Derive and print the per-user token for a username
+    GetUserToken {
+        #[arg(value_name = "USERNAME")]
+        username: String,
+    },
+}
+
+fn main() -> PinResult<()> {
     rust_i18n::set_locale(locale_config::Locale::current().as_ref());
     if let Err(e) = sandbox::pinutil_sandbox() {
         eprintln!("{}: {}", t!("sandbox_fail"), e);
     }
     let cli = Cli::parse();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(if cli.verbose { "debug" } else { "none" }),
-    )
-    .target(env_logger::Target::Stderr)
-    .init();
+    // Don't read RUST_LOG: this binary is setuid/setgid, so an attacker-controlled
+    // environment must not be able to crank up logging. Verbosity is driven solely
+    // by the `-v` flag.
+    env_logger::Builder::new()
+        .filter_level(if cli.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Off
+        })
+        .target(env_logger::Target::Stderr)
+        .init();
     if !cli.verbose {
         unsafe {
             std::env::set_var("TSS2_LOG", "all+NONE");
@@ -100,13 +133,159 @@ fn main() -> Result<()> {
         Commands::Status { username } => {
             handle_result(show_status(&resolve_username(username)?, machine), machine)
         }
+        Commands::MasterKey(cmd) => {
+            if let Err(e) = require_root() {
+                handle_result::<()>(Err(e), machine);
+            }
+            match cmd {
+                MasterKeyCommands::Init => handle_result(master_key_init(machine), machine),
+                MasterKeyCommands::Status => handle_result(master_key_status(machine), machine),
+                MasterKeyCommands::ImportToTpm => {
+                    handle_result(master_key_import_to_tpm(machine), machine)
+                }
+                MasterKeyCommands::ClearFromTpm => {
+                    handle_result(master_key_clear_from_tpm(machine), machine)
+                }
+                MasterKeyCommands::ClearFromDisk => {
+                    handle_result(master_key_clear_from_disk(machine), machine)
+                }
+                MasterKeyCommands::GetUserToken { username } => {
+                    if machine {
+                        handle_result(master_key_get_user_token(&username), machine)
+                    } else {
+                        // Human mode must print the token.
+                        match master_key_get_user_token(&username) {
+                            Ok(token) => println!("{token}"),
+                            Err(e) => {
+                                eprintln!("{}", t!("error_result", "error" => e));
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     };
     Ok(())
 }
 
-fn handle_result<T>(res: Result<T>, machine: bool)
+fn require_root() -> PinResult<()> {
+    if get_uid() != 0 {
+        return Err(PinError::PermissionDenied);
+    }
+    Ok(())
+}
+
+fn require_interactive(machine: bool, purpose: String) -> PinResult<()> {
+    if machine {
+        return Err(PinError::TermIoError(
+            t!("requires_interactive_confirmation", "purpose" => purpose).to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_line(prompt: &str) -> PinResult<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str) -> PinResult<bool> {
+    let input = prompt_line(prompt)?;
+    Ok(input.trim().to_lowercase().starts_with('y'))
+}
+
+fn prompt_acknowledgement(expected: &str, prompt: &str) -> PinResult<()> {
+    let got = prompt_line(prompt)?;
+    if got.trim() != expected {
+        return Err(PinError::TermIoError(t!("cancelled").to_string()));
+    }
+    Ok(())
+}
+
+fn master_key_status(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyStatus> {
+    let st = master_key::status()?;
+    if !machine {
+        println!("sealed_file_present: {}", st.sealed_file_present);
+        println!("rsa_parent_present: {}", st.rsa_parent_present);
+        println!("hmac_key_present: {}", st.hmac_key_present);
+        println!("sealed_file_path: {}", st.sealed_file_path);
+        println!("rsa_handle: 0x{:08x}", st.rsa_handle);
+        println!("hmac_handle: 0x{:08x}", st.hmac_handle);
+    }
+    Ok(st)
+}
+
+fn master_key_init(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyInitResult> {
+    if !machine {
+        eprintln!("{}", t!("mk_warn_init_new_key"));
+        eprintln!("{}", t!("mk_warn_init_break_old_unlocks"));
+        let proceed_prompt = t!("mk_proceed_prompt");
+        if !prompt_yes_no(&proceed_prompt)? {
+            return Err(PinError::TermIoError(t!("cancelled").to_string()));
+        }
+    }
+
+    let res = master_key::init()?;
+    if !machine {
+        println!(
+            "\n{}\n\n{}\n",
+            t!("mk_recovery_phrase_header"),
+            res.recovery_phrase
+        );
+        let confirm_prompt = t!("mk_recovery_confirm_prompt");
+        let confirm = prompt_line(&confirm_prompt)?;
+        if confirm.trim() != res.recovery_phrase.trim() {
+            return Err(PinError::TermIoError(
+                t!("mk_recovery_confirm_mismatch").to_string(),
+            ));
+        }
+    }
+    Ok(res)
+}
+
+fn master_key_import_to_tpm(machine: bool) -> PinResult<pinpam_core::master_key::MasterKeyStatus> {
+    require_interactive(machine, t!("mk_purpose_import").to_string())?;
+    let phrase_prompt = t!("mk_recovery_phrase_prompt");
+    let phrase = prompt_line(&phrase_prompt)?;
+    let st = master_key::import_to_tpm(&phrase)?;
+    println!("{}", t!("mk_import_success"));
+    Ok(st)
+}
+
+fn master_key_clear_from_tpm(machine: bool) -> PinResult<()> {
+    require_interactive(machine, t!("mk_purpose_tpm_clear").to_string())?;
+    eprintln!("{}", t!("mk_warn_clear_tpm"));
+    let ack_prompt = t!("mk_ack_prompt");
+    prompt_acknowledgement("yes", &ack_prompt)?;
+    master_key::clear_from_tpm()?;
+    println!("{}", t!("mk_clear_tpm_success"));
+    Ok(())
+}
+
+fn master_key_clear_from_disk(machine: bool) -> PinResult<()> {
+    require_interactive(machine, t!("mk_purpose_disk_clear").to_string())?;
+    eprintln!(
+        "{}",
+        t!("mk_warn_clear_disk", "path" => MASTER_KEY_SEALED_FILE)
+    );
+    let ack_prompt = t!("mk_ack_prompt");
+    prompt_acknowledgement("yes", &ack_prompt)?;
+    master_key::clear_from_disk()?;
+    println!("{}", t!("mk_clear_disk_success"));
+    Ok(())
+}
+
+fn master_key_get_user_token(username: &str) -> PinResult<String> {
+    master_key::derive_user_token(username)
+}
+
+fn handle_result<T>(res: PinResult<T>, machine: bool)
 where
-    Result<T>: serde::Serialize,
+    PinResult<T>: serde::Serialize,
 {
     if !machine {
         // In human mode, stay quiet unless there's an error, which go to stderr.
@@ -122,11 +301,11 @@ where
     }
 }
 
-fn new_manager() -> Result<PinManager> {
-    PinManager::new(PinPolicy::load_from_standard_locations())
+fn new_manager() -> PinResult<PinManager> {
+    PinManager::new(PinPolicy::cached().clone())
 }
 
-fn setup_pin(username: &str, machine: bool) -> Result<()> {
+fn setup_pin(username: &str, machine: bool) -> PinResult<()> {
     let uid = get_uid_from_username(username)?;
 
     if !can_manage_pin(uid) {
@@ -143,7 +322,7 @@ fn setup_pin(username: &str, machine: bool) -> Result<()> {
         Ok(Some(_)) => {
             return Err(PinError::PinAlreadySet);
         }
-        Err(pinpam_core::PinError::NotProvisioned(_)) => {
+        Err(pinpam_core::pinerror::PinError::NotProvisioned(_)) => {
             // Good - no PIN set, we can proceed
         }
         Err(e) => {
@@ -155,19 +334,19 @@ fn setup_pin(username: &str, machine: bool) -> Result<()> {
     // only prompt for confirmation when stdin is an interactive terminal
     if !machine {
         let confirm = prompt_pin(&t!("confirm_pin"), None, machine)?;
-        if pin != confirm {
+        if pin.as_str() != confirm.as_str() {
             return Err(PinError::PinsDontMatch);
         }
     }
 
-    manager.setup_pin(uid, pin)?;
+    manager.setup_pin(uid, &pin)?;
     if !machine {
         println!("{}", t!("pin_set_for_user", "username" => username));
     }
     Ok(())
 }
 
-fn change_pin(username: &str, machine: bool) -> Result<()> {
+fn change_pin(username: &str, machine: bool) -> PinResult<()> {
     let uid = get_uid_from_username(username)?;
 
     if !can_manage_pin(uid) {
@@ -202,7 +381,7 @@ fn change_pin(username: &str, machine: bool) -> Result<()> {
         let new_pin = prompt_pin(&t!("new_pin"), None, machine)?;
         if !machine {
             let confirm = prompt_pin(&t!("confirm"), None, machine)?;
-            if new_pin != confirm {
+            if new_pin.as_str() != confirm.as_str() {
                 return Err(PinError::PinsDontMatch);
             }
         }
@@ -210,7 +389,7 @@ fn change_pin(username: &str, machine: bool) -> Result<()> {
         match manager.delete_pin_with_auth(uid, &current)? {
             DeleteResult::Success => {
                 manager.clear_sessions();
-                manager.setup_pin(uid, new_pin)?;
+                manager.setup_pin(uid, &new_pin)?;
                 if !machine {
                     println!("{}", t!("pin_changed_for_user", "username" => username));
                 }
@@ -222,13 +401,13 @@ fn change_pin(username: &str, machine: bool) -> Result<()> {
         let new_pin = prompt_pin(&t!("new_pin"), None, machine)?;
         if !machine {
             let confirm = prompt_pin(&t!("confirm"), None, machine)?;
-            if new_pin != confirm {
+            if new_pin.as_str() != confirm.as_str() {
                 return Err(PinError::PinsDontMatch);
             }
         }
         manager.delete_pin_admin(uid)?;
         manager.clear_sessions();
-        manager.setup_pin(uid, new_pin)?;
+        manager.setup_pin(uid, &new_pin)?;
         if !machine {
             println!("{}", t!("pin_changed_for_user", "username" => username));
         }
@@ -236,7 +415,7 @@ fn change_pin(username: &str, machine: bool) -> Result<()> {
     Ok(())
 }
 
-fn delete_pin(username: &str, machine: bool) -> Result<()> {
+fn delete_pin(username: &str, machine: bool) -> PinResult<()> {
     let uid = get_uid_from_username(username)?;
 
     let current_uid = get_uid();
@@ -296,8 +475,18 @@ fn delete_pin(username: &str, machine: bool) -> Result<()> {
     }
 }
 
-fn test_pin(username: &str, machine: bool) -> Result<()> {
+fn test_pin(username: &str, machine: bool) -> PinResult<()> {
     let uid = get_uid_from_username(username)?;
+
+    // Each wrong attempt permanently consumes a TPM lockout slot. Restrict
+    // verification to the target user themselves or to a process running with
+    // effective uid 0 (login/sudo/su/polkit drive PAM with euid 0). In the
+    // setgid deployment this still blocks a direct unprivileged
+    // `pinutil test <victim>` loop from locking out every account, while leaving
+    // all PAM paths -- including `su` to another user -- working.
+    if !can_attempt_pin(uid) {
+        return Err(PinError::PermissionDenied);
+    }
 
     let mut manager = new_manager()?;
 
@@ -342,7 +531,7 @@ fn test_pin(username: &str, machine: bool) -> Result<()> {
     }
 }
 
-fn show_status(username: &str, machine: bool) -> Result<Option<AttemptInfo>> {
+fn show_status(username: &str, machine: bool) -> PinResult<Option<AttemptInfo>> {
     let uid = get_uid_from_username(username)?;
 
     let mut manager = new_manager()?;
@@ -376,11 +565,11 @@ fn show_status(username: &str, machine: bool) -> Result<Option<AttemptInfo>> {
     Ok(info)
 }
 
-fn get_attempt_info(manager: &mut PinManager, uid: u32) -> Result<Option<AttemptInfo>> {
+fn get_attempt_info(manager: &mut PinManager, uid: u32) -> PinResult<Option<AttemptInfo>> {
     Ok(manager.get_pin_slot(uid)?.map(AttemptInfo::from_pin_data))
 }
 
-fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> Result<String> {
+fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> PinResult<Pin> {
     use nix::sys::termios::{self, LocalFlags, SetArg};
 
     let stdin = std::io::stdin();
@@ -416,15 +605,10 @@ fn prompt_pin(prompt: &str, attempts: Option<(u32, u32)>, machine: bool) -> Resu
         io::stdin().read_line(&mut input)?;
     };
 
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(PinError::PinIsEmpty);
-    }
-
-    Ok(trimmed.to_string())
+    Pin::new(&input, PinPolicy::cached())
 }
 
-fn resolve_username(username: Option<String>) -> Result<String> {
+fn resolve_username(username: Option<String>) -> PinResult<String> {
     if let Some(username) = username {
         return Ok(username);
     }

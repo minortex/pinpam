@@ -1,13 +1,10 @@
 [package]
-name = "pinpam-pam"
+name = "pinpam-master-key"
 version = "0.0.5"
-edition = "2021"
-description = "TPM PIN authentication PAM module"
-license = "MIT"
+edition = "2024"
 
 [lib]
-name = "pinpam"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 log = { workspace = true }
@@ -21,8 +18,3 @@ rust-i18n = { workspace = true }
 locale_config = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Add PAM bindings when available
-# pam-sys = "1.0"  # or whatever PAM crate you prefer
-
-[features]
-default = []
