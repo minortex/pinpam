@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "pinpam-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "pinpam-master-key"
-version = "0.1.0"
+version = "0.0.5"
 dependencies = [
  "env_logger",
  "libc",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "pinpam-pam"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "env_logger",
  "libc",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "pinutil"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "env_logger",

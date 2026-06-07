@@ -23,7 +23,7 @@ mod sandbox;
 #[command(
     name = "pinutil",
     about = "TPM PIN authentication utility",
-    version = "0.1.0"
+    version = "0.0.5"
 )]
 struct Cli {
     #[command(subcommand)]
