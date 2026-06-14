@@ -12,6 +12,7 @@ pub enum PinError {
     PinIsLocked,
     IncorrectPin { locked: bool },
     PinIsEmpty,
+    #[deprecated(note = "Mixed-character PINs are now supported; this error is never returned")]
     PinContainsNonDigits,
     GetUsernameForUidFailed(u32),
     CannotDeletePin(DeleteResult),
@@ -45,6 +46,7 @@ impl From<nix::errno::Errno> for PinError {
 }
 
 impl std::fmt::Display for PinError {
+    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
             Self::UserNotFound => t!("user_not_found"),

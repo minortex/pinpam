@@ -891,11 +891,10 @@ mod tests {
             try_first_pass: true,
             use_first_pass: false,
         };
-        // Letters: not a digit-only PIN; should fall through to prompting
-        // without consuming a TPM attempt.
-        assert!(decide_first_pass(args, Some("hunter2"), &policy).is_prompt_user());
-        // Too short: also not a valid PIN under this policy.
+        // Too short: not a valid PIN under this policy.
         assert!(decide_first_pass(args, Some("12"), &policy).is_prompt_user());
+        // Too long: exceeds max_length of 8.
+        assert!(decide_first_pass(args, Some("123456789"), &policy).is_prompt_user());
         // Missing authtok entirely.
         assert!(decide_first_pass(args, None, &policy).is_prompt_user());
     }
@@ -907,8 +906,13 @@ mod tests {
             try_first_pass: false,
             use_first_pass: true,
         };
-        assert!(decide_first_pass(args, Some("hunter2"), &policy).is_deny());
+        // Empty string is invalid.
         assert!(decide_first_pass(args, Some(""), &policy).is_deny());
+        // Too short.
+        assert!(decide_first_pass(args, Some("123"), &policy).is_deny());
+        // Too long.
+        assert!(decide_first_pass(args, Some("123456789"), &policy).is_deny());
+        // No authtok cached.
         assert!(decide_first_pass(args, None, &policy).is_deny());
     }
 

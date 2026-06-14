@@ -79,9 +79,8 @@ impl PinPolicy {
         if pin.is_empty() {
             return Err(PinError::PinIsEmpty);
         }
-        if !pin.chars().all(|c| c.is_ascii_digit()) {
-            return Err(PinError::PinContainsNonDigits);
-        }
+        // Allow any printable ASCII characters (letters, digits, symbols)
+        // TPM auth values support arbitrary byte sequences
 
         let length = pin.len();
         if length < self.min_length {

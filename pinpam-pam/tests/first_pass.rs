@@ -44,7 +44,7 @@ fn pam_line_try_first_pass_falls_through_for_non_pin_token() {
     let args = ModuleArgs::from_strs(["try_first_pass"].into_iter());
     let policy = policy();
 
-    for non_pin in ["sup3rs3cret", "abc", "", "1234a"] {
+    for non_pin in ["", "123", "123456789"] {
         let decision = decide_first_pass(args, Some(non_pin), &policy);
         assert!(
             decision.is_prompt_user(),
@@ -64,7 +64,7 @@ fn pam_line_use_first_pass_denies_non_pin_token_without_prompt() {
 
     let policy = policy();
 
-    for non_pin in ["sup3rs3cret", "", "1234a", "12"] {
+    for non_pin in ["", "12", "123456789"] {
         let decision = decide_first_pass(args, Some(non_pin), &policy);
         assert!(
             decision.is_deny(),
@@ -95,7 +95,7 @@ fn pam_line_with_both_flags_uses_strictest_failure_mode() {
     let policy = policy();
 
     assert!(decide_first_pass(args, Some("4321"), &policy).is_try_first_pass());
-    assert!(decide_first_pass(args, Some("not-a-pin"), &policy).is_deny());
+    assert!(decide_first_pass(args, Some("123"), &policy).is_deny());
     assert!(decide_first_pass(args, None, &policy).is_deny());
 }
 
@@ -107,7 +107,7 @@ fn pam_line_without_flags_ignores_authtok() {
     let policy = policy();
 
     assert!(decide_first_pass(args, Some("4242"), &policy).is_prompt_user());
-    assert!(decide_first_pass(args, Some("hunter2"), &policy).is_prompt_user());
+    assert!(decide_first_pass(args, Some("P@ssw0rd"), &policy).is_prompt_user());
     assert!(decide_first_pass(args, None, &policy).is_prompt_user());
 }
 
